@@ -19,6 +19,8 @@ const buttonVariants = cva(
         destructive:
           "bg-destructive/10 text-destructive hover:bg-destructive/20 focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:focus-visible:ring-destructive/40",
         link: "text-primary underline-offset-4 hover:underline",
+        primary: "duration-300 ease-out backdrop-blur-lg bg-gradient-to-r from-gray-400 to-gray-500 text-white border-transparent hover:shadow-[0_0_20px_rgba(255,255,255,0.7)] hover:scale-110",
+        glass: "duration-300 ease-out backdrop-blur-lg bg-white/10 text-white border-white/20 hover:bg-white/20 hover:shadow-[0_0_20px_rgba(255,255,255,0.7)] hover:scale-110",
       },
       size: {
         default:
@@ -26,6 +28,7 @@ const buttonVariants = cva(
         xs: "h-6 gap-1 rounded-none px-2 text-xs has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3",
         sm: "h-7 gap-1 rounded-none px-2.5 has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3.5",
         lg: "h-9 gap-1.5 px-2.5 has-data-[icon=inline-end]:pr-3 has-data-[icon=inline-start]:pl-3",
+        xl: "h-12 ",
         icon: "size-8",
         "icon-xs": "size-6 rounded-none [&_svg:not([class*='size-'])]:size-3",
         "icon-sm": "size-7 rounded-none",
