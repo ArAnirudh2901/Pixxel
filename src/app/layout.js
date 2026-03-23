@@ -4,8 +4,39 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "sonner";
 import FloatingShapes from "@/components/floating-shapes";
 import Header from "@/components/header";
+import { ConvexClientProvider } from "./ConvexClientProvider";
+import { ClerkProvider } from "@clerk/nextjs";
+import { dark } from "@clerk/themes";
 
 const inter = Inter({ subsets: ["latin"] })
+
+const clerkAppearance = {
+  baseTheme: dark,
+  variables: {
+    colorPrimary: "#4f6b98",
+    colorPrimaryForeground: "#ffffff",
+    colorTextOnPrimaryBackground: "#ffffff",
+    colorBackground: "#111827",
+    colorInputBackground: "rgba(15, 23, 42, 0.55)",
+    colorText: "#e5e7eb",
+    borderRadius: "14px",
+  },
+  elements: {
+    card: "bg-slate-900/80 border border-white/10 shadow-2xl backdrop-blur-xl",
+    headerTitle: "text-white",
+    headerSubtitle: "text-slate-300",
+    formFieldInput:
+      "bg-slate-800/70 border border-slate-600 text-white placeholder:text-slate-400",
+    formButtonPrimary:
+      "bg-[linear-gradient(135deg,#526892,#3a507a,#273a5c)] !text-white hover:!text-white focus:!text-white !justify-center !items-center !text-center gap-2 border border-slate-200/10 hover:brightness-105",
+    footerActionLink: "text-cyan-300 hover:text-cyan-200",
+    userButtonAvatarBox: "ring-2 ring-white/20",
+    userButtonPopoverCard: "bg-slate-900/95 border border-white/10 shadow-2xl",
+    userButtonPopoverActionButton: "text-slate-200 hover:bg-white/10",
+    userButtonPopoverActionButtonText: "text-slate-200",
+    userButtonPopoverFooter: "border-t border-white/10",
+  },
+};
 
 export const metadata = {
   title: "Create Next App",
@@ -14,24 +45,32 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
-      <body
-        className={`${inter.className}`}
-      >
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="dark"
-          enableSystem
-          disableTransitionOnChange
+    <ClerkProvider
+      afterSignOutUrl="/"
+      appearance={clerkAppearance}
+    >
+
+      <html lang="en" className="dark" suppressHydrationWarning>
+        <body
+          className={`${inter.className}`}
         >
-          <Header />
-          <main className="bg-slate-900 min-h-screen text-white overflow-x-hidden">
-            <FloatingShapes />
-            <Toaster richColors />
-            {children}
-          </main>
-        </ThemeProvider>
-      </body>
-    </html>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="dark"
+            enableSystem
+            disableTransitionOnChange
+          >
+            <ConvexClientProvider>
+              <Header />
+              <main className="bg-slate-900 min-h-screen text-white overflow-x-hidden">
+                <FloatingShapes />
+                <Toaster richColors />
+                {children}
+              </main>
+            </ConvexClientProvider>
+          </ThemeProvider>
+        </body>
+      </html>
+    </ClerkProvider>
   );
 }
