@@ -34,7 +34,7 @@ const usePlanAccess = () => {
     const canCreateProject = (currentProjectCount) => {
         if (isPro) return true;
 
-        return currentExportsThisMonth < 20
+        return currentProjectCount < 3
     }
 
     const canExport = (currentExportsThisMonth) => {
