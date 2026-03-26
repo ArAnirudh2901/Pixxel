@@ -128,9 +128,9 @@
   }
 }
 
-@keyframes header-loading-sweep {
+@keyframes loading-bar-sweep {
   0% {
-    transform: translateX(-140%);
+    transform: translate3d(-140%, 0, 0);
     opacity: 0;
   }
 
@@ -139,11 +139,29 @@
   }
 
   100% {
-    transform: translateX(340%);
+    transform: translate3d(340%, 0, 0);
     opacity: 1;
   }
 }
 
-.animate-header-loading-sweep {
-  animation: header-loading-sweep 1.1s linear infinite;
+.animate-loading-bar-sweep {
+  animation: loading-bar-sweep 1.1s linear infinite;
+}
+
+/* Center Clerk PricingTable cards at all sizes */
+.pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"],
+.pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  justify-content: center !important;
+  gap: 2.5rem !important;
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+/* Make each pricing card wider */
+.pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div > div {
+  flex: 0 1 460px !important;
+  min-width: 360px !important;
 }

@@ -6,6 +6,7 @@ import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import React, { useEffect, useRef, useState } from 'react'
 import { Button } from './ui/button'
+import LoadingBar from './ui/loading-bar'
 import { useStoreUser } from '../../hooks/useStoreUser'
 import { LayoutDashboard } from 'lucide-react'
 
@@ -60,6 +61,14 @@ const Header = () => {
         if (loadingTimeoutRef.current) {
             window.clearTimeout(loadingTimeoutRef.current)
             loadingTimeoutRef.current = null
+        }
+
+        const resetFrame = window.requestAnimationFrame(() => {
+            setLoadingState({ mode: 'idle', routeKey: null })
+        })
+
+        return () => {
+            window.cancelAnimationFrame(resetFrame)
         }
     }, [loadingState.mode, loadingState.routeKey, routeKey])
 
@@ -141,13 +150,6 @@ const Header = () => {
                     >
                         Contact
                     </a>
-
-                    <a
-                        href='#dashboard'
-                        className="text-white font-medium transition-all duration-300 hover:text-cyan-400 cursor-pointer"
-                    >
-                        Dashboard
-                    </a>
                 </div>}
 
                 <Show when="signed-out">
@@ -165,29 +167,25 @@ const Header = () => {
                     </div>
                 </Show>
                 <Show when="signed-in">
-                    <Link href="/dashboard">
-                        <Button variant='glass' className="hidden sm:flex">
+                    <Button asChild variant='glass' className="hidden h-11 px-5 text-sm font-semibold sm:flex">
+                        <Link href="/dashboard">
                             <LayoutDashboard className="h-4 w-4" />
                             <span className='hidden md:flex'>Dashboard</span>
-                        </Button>
-                    </Link>
+                        </Link>
+                    </Button>
 
                     <div className='ml-4 flex min-h-11 min-w-11 shrink-0 items-center justify-end md:ml-8'>
                         <UserButton userProfileMode="modal" />
                     </div>
                 </Show>
 
-                <div
-                    aria-hidden="true"
-                    className={`pointer-events-none absolute inset-x-4 bottom-0 h-[2px] rounded-full bg-white/14 transition-opacity duration-200 ${isHeaderLoading ? 'opacity-100' : 'opacity-0'}`}
-                >
-                    {isHeaderLoading && (
-                        <span
-                            key={loadingBarKey}
-                            className='animate-header-loading-sweep absolute inset-y-0 left-0 w-1/2 rounded-full bg-[linear-gradient(90deg,rgba(34,211,238,0),rgba(103,232,249,0.95),rgba(255,255,255,0.98),rgba(34,211,238,0))] shadow-[0_0_16px_rgba(103,232,249,0.55)]'
-                        />
-                    )}
-                </div>
+                <LoadingBar
+                    isVisible={isHeaderLoading}
+                    barKey={loadingBarKey}
+                    className='absolute inset-x-4 bottom-0 z-10'
+                    trackClassName='bg-white/[0.08]'
+                    barWidthClassName='w-[58%]'
+                />
             </div>
         </header>
     )
