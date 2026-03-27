@@ -257,6 +257,7 @@ const Dashboard = () => {
                 <NewProjectModel
                     isOpen={showNewProjectModal}
                     onClose={() => setShowNewProjectModal(false)}
+                    currentProjectCount={projectCount}
                 />
             </div>
         </div>

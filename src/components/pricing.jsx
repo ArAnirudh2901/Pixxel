@@ -3,6 +3,7 @@
 import { PricingTable } from '@clerk/nextjs'
 import React from 'react'
 import useIntersectionObserver from '../../hooks/useIntersectionObserver'
+import { pricingTableAppearance } from '@/lib/pricing-table-appearance'
 
 const Pricing = () => {
     const [headingRef, headingVisible] = useIntersectionObserver()
@@ -31,11 +32,7 @@ const Pricing = () => {
                 className={`pricing-table-shell mx-auto flex max-w-6xl justify-center transition-all duration-700 ease-out delay-200 ${tableVisible ? 'translate-y-0 opacity-100' : 'translate-y-6 opacity-0'}`}
             >
                 <PricingTable
-                    appearance={{
-                        elements: {
-                            card: 'drop-shadow-xl',
-                        },
-                    }}
+                    appearance={pricingTableAppearance}
                 />
             </div>
         </section>

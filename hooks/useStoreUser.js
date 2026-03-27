@@ -3,6 +3,7 @@ import { useConvexAuth } from "convex/react";
 import { useEffect, useState } from "react";
 import { useMutation } from "convex/react";
 import { api } from "../convex/_generated/api";
+import { toast } from "sonner";
 
 export function useStoreUser() {
     const { isLoading, isAuthenticated } = useConvexAuth();
@@ -14,22 +15,49 @@ export function useStoreUser() {
     // Call the `storeUser` mutation function to store
     // the current user in the `users` table and return the `Id` value.
     useEffect(() => {
-        // If the user is not logged in don't do anything
-        if (!isAuthenticated) {
-            return;
+        let isCancelled = false;
+
+        // Wait until auth has settled and we have a Clerk user id before syncing.
+        if (isLoading || !isAuthenticated || !user?.id) {
+            return () => {
+                isCancelled = true;
+            };
         }
+
         // Store the user in the database.
         // Recall that `storeUser` gets the user information via the `auth`
         // object on the server. You don't need to pass anything manually here.
         async function createUser() {
-            const id = await storeUser();
-            setUserId(id);
+            try {
+                const id = await storeUser();
+
+                if (!isCancelled) {
+                    setUserId(id);
+                }
+            } catch (error) {
+                if (!isCancelled) {
+                    setUserId(null);
+                }
+
+                const message =
+                    error instanceof Error
+                        ? error.message
+                        : "Unable to sync your account right now.";
+
+                console.error("Failed to store signed-in user in Convex.", error);
+                toast.error(message);
+            }
         }
+
         createUser();
-        return () => setUserId(null);
+
+        return () => {
+            isCancelled = true;
+            setUserId(null);
+        };
         // Make sure the effect reruns if the user logs in with
         // a different identity
-    }, [isAuthenticated, storeUser, user?.id]);
+    }, [isAuthenticated, isLoading, storeUser, user?.id]);
     // Combine the local state with the state from context
     return {
         isLoading: isLoading || (isAuthenticated && userId === null),

@@ -149,12 +149,20 @@
 }
 
 /* Center Clerk PricingTable cards at all sizes */
+.pricing-table-shell {
+  width: 100%;
+}
+
+.pricing-table-shell [data-clerk-component="PricingTable"] {
+  width: 100% !important;
+}
+
 .pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"],
 .pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div {
   display: flex !important;
   flex-wrap: wrap !important;
   justify-content: center !important;
-  gap: 2.5rem !important;
+  gap: clamp(1.25rem, 3vw, 2.5rem) !important;
   width: 100% !important;
   margin-left: auto !important;
   margin-right: auto !important;
@@ -162,6 +170,16 @@
 
 /* Make each pricing card wider */
 .pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div > div {
-  flex: 0 1 460px !important;
-  min-width: 360px !important;
+  flex: 1 1 460px !important;
+  width: min(100%, 460px) !important;
+  min-width: min(100%, 320px) !important;
+  color: rgba(255, 255, 255, 0.96) !important;
+}
+
+.pricing-table-shell--upgrade [data-clerk-component="PricingTable"][data-component-status="ready"] > div > div:first-child {
+  display: none !important;
+}
+
+.pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div > div :is(h1, h2, h3, h4, p, span, li, svg) {
+  color: inherit !important;
 }
