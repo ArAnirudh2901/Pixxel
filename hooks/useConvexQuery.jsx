@@ -1,38 +1,50 @@
 "use client"
 
-import { useMutation, useQuery } from "convex/react"
-import { useEffect, useState } from "react"
+import { useMutation, useQueries } from "convex/react"
+import { getFunctionName } from "convex/server"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 
 export const useConvexQuery = (query, ...args) => {
     const isSkipped = args[0] === "skip"
-    const result = useQuery(query, ...args)
-
-    const [data, setData] = useState(undefined)
-    const [isLoading, setIsLoading] = useState(true)
-    const [error, setError] = useState(null)
+    const queryArgs = isSkipped ? {} : (args[0] ?? {})
+    const queryName = isSkipped ? null : getFunctionName(query)
+    const serializedQueryArgs = JSON.stringify(queryArgs)
+    const queryRequests = useMemo(
+        () => (
+            isSkipped
+                ? {}
+                : {
+                    queryResult: {
+                        query: queryName,
+                        args: JSON.parse(serializedQueryArgs),
+                    },
+                }
+        ),
+        [isSkipped, queryName, serializedQueryArgs],
+    )
+    const results = useQueries(queryRequests)
+    const result = isSkipped ? undefined : results.queryResult
+    const lastErrorMessageRef = useRef(null)
+    const error = result instanceof Error ? result : null
+    const data = error || isSkipped ? undefined : result
+    const isLoading = !isSkipped && result === undefined
 
     useEffect(() => {
         if (isSkipped) {
-            setData(undefined)
-            setError(null)
-            setIsLoading(false)
+            lastErrorMessageRef.current = null
+            return
         }
-        else if (result === undefined)
-            setIsLoading(true)
 
-        else {
-            try {
-                setData(result)
-                setError(null)
-            } catch (err) {
-                setError(err)
-                toast.error(err.message)
-            } finally {
-                setIsLoading(false)
+        if (error) {
+            if (lastErrorMessageRef.current !== error.message) {
+                toast.error(error.message)
+                lastErrorMessageRef.current = error.message
             }
+        } else {
+            lastErrorMessageRef.current = null
         }
-    }, [isSkipped, result])
+    }, [error, isSkipped])
 
     return { data, isLoading, error }
 }

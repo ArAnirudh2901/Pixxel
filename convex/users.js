@@ -1,3 +1,4 @@
+import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 
 function getDisplayName(identity) {
@@ -62,24 +63,66 @@ export const store = mutation({
     },
 });
 
+export const getAuthUserId = async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+        throw new Error("Not Authenticated");
+    }
+
+    const user = await ctx.db
+        .query("users")
+        .withIndex("by_token", (q) =>
+            q.eq("tokenIdentifier", identity.tokenIdentifier))
+        .unique();
+
+    if (!user) {
+        throw new Error("User not found.");
+    }
+
+    return user;
+};
+
 export const getCurrentUser = query({
     args: {},
     handler: async (ctx) => {
+        return await getAuthUserId(ctx);
+    }
+});
+
+export const syncPlan = mutation({
+    args: {
+        plan: v.union(v.literal("free"), v.literal("pro")),
+    },
+    handler: async (ctx, args) => {
         const identity = await ctx.auth.getUserIdentity();
+
         if (!identity) {
-            throw new Error("Not Authenticated");
+            throw new Error("Not authenticated");
         }
 
         const user = await ctx.db
             .query("users")
             .withIndex("by_token", (q) =>
-                q.eq("tokenIdentifier", identity.tokenIdentifier))
+                q.eq("tokenIdentifier", identity.tokenIdentifier),
+            )
             .unique();
 
         if (!user) {
             throw new Error("User not found.");
         }
 
-        return user;
-    }
+        const updates = {
+            lastActiveAt: Date.now(),
+        };
+
+        if (user.plan !== args.plan) {
+            updates.plan = args.plan;
+        }
+
+        await ctx.db.patch(user._id, updates);
+
+        return {
+            plan: args.plan,
+        };
+    },
 });

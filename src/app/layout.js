@@ -1,7 +1,7 @@
 import { Inter } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
-import { Toaster } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
 import FloatingShapes from "@/components/floating-shapes";
 import Header from "@/components/header";
 import { ConvexClientProvider } from "./ConvexClientProvider";
@@ -16,25 +16,51 @@ const clerkAppearance = {
     colorPrimary: "#4f6b98",
     colorPrimaryForeground: "#ffffff",
     colorTextOnPrimaryBackground: "#ffffff",
-    colorBackground: "#111827",
-    colorInputBackground: "rgba(15, 23, 42, 0.55)",
-    colorText: "#e5e7eb",
+    colorBackground: "#0f172a",
+    colorInputBackground: "rgba(15, 23, 42, 0.78)",
+    colorInputText: "#f8fafc",
+    colorText: "#f8fafc",
+    colorTextSecondary: "#ffffff",
+    colorNeutral: "#f8fafc",
+    colorDanger: "#f87171",
     borderRadius: "14px",
   },
   elements: {
-    card: "bg-slate-900/80 border border-white/10 shadow-2xl backdrop-blur-xl",
-    headerTitle: "text-white",
-    headerSubtitle: "text-slate-300",
+    card: "bg-slate-900/95 border border-white/10 shadow-2xl backdrop-blur-xl !text-slate-100",
+    main: "text-white",
+    headerTitle: "!text-white",
+    headerSubtitle: "!text-white",
+    formHeaderTitle: "!text-white",
+    formHeaderSubtitle: "!text-white",
+    dividerText: "text-white",
+    dividerLine: "bg-white/10",
+    socialButtonsBlockButton:
+      "bg-slate-800/70 border border-slate-600/90 text-white hover:bg-slate-700/80",
+    socialButtonsBlockButtonText: "!text-white",
+    formFieldLabelRow: "!text-white",
+    formFieldLabel: "!text-white",
     formFieldInput:
       "bg-slate-800/70 border border-slate-600 text-white placeholder:text-slate-400",
+    formFieldHintText: "text-white",
+    formFieldErrorText: "text-rose-300",
+    formResendCodeLink: "text-white hover:text-white",
     formButtonPrimary:
       "bg-[linear-gradient(135deg,#526892,#3a507a,#273a5c)] !text-white hover:!text-white focus:!text-white !justify-center !items-center !text-center gap-2 border border-slate-200/10 hover:brightness-105",
-    footerActionLink: "text-cyan-300 hover:text-cyan-200",
+    footerActionText: "text-white",
+    footerActionLink: "text-white hover:text-white",
     userButtonAvatarBox: "ring-2 ring-white/20",
-    userButtonPopoverCard: "bg-slate-900/95 border border-white/10 shadow-2xl",
-    userButtonPopoverActionButton: "text-slate-200 hover:bg-white/10",
-    userButtonPopoverActionButtonText: "text-slate-200",
+    userButtonPopoverCard: "bg-slate-900/95 border border-white/10 shadow-2xl !text-white",
+    userButtonPopoverMain: "text-white",
+    userButtonPopoverActions: "border-t border-white/10",
+    userButtonPopoverActionButton: "text-white hover:bg-white/10",
+    userButtonPopoverActionButtonIcon: "text-white",
     userButtonPopoverFooter: "border-t border-white/10",
+    userButtonPopoverFooterPagesLink: "text-white hover:text-white",
+    userPreviewTextContainer: "text-white",
+    userPreviewMainIdentifier: "text-white",
+    userPreviewMainIdentifierText: "text-white",
+    userPreviewSecondaryIdentifier: "text-white",
+    identityPreviewText: "text-white",
   },
 };
 
@@ -64,7 +90,7 @@ export default function RootLayout({ children }) {
               <Header />
               <main className="bg-slate-900 min-h-screen text-white overflow-x-hidden">
                 <FloatingShapes />
-                <Toaster richColors />
+                <Toaster />
                 {children}
               </main>
             </ConvexClientProvider>

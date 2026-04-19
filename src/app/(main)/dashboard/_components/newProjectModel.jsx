@@ -62,7 +62,7 @@ const NewProjectModel = ({ isOpen, onClose, currentProjectCount = 0 }) => {
     })
 
     const handleCreateProject = async () => {
-        if (true) {
+        if (!canCreate) {
             setShowUpgradeModel(true)
             return
         }
@@ -182,9 +182,9 @@ const NewProjectModel = ({ isOpen, onClose, currentProjectCount = 0 }) => {
                                 </p>
                             </div>
                             : <div className='space-y-6'>
-                                <div className='relative'>
+                                <div className='relative overflow-hidden rounded-xl border border-white/10 bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.14),transparent_42%),linear-gradient(160deg,rgba(15,23,42,0.92),rgba(15,23,42,0.74))]'>
                                     <img
-                                        className='w-full h-64 object-cover rounded-xl border border-white/10'
+                                        className='h-64 w-full object-contain p-3'
                                         src={previewUrl}
                                         alt="Uploaded image preview" />
 

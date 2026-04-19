@@ -183,3 +183,187 @@
 .pricing-table-shell [data-clerk-component="PricingTable"][data-component-status="ready"] > div > div :is(h1, h2, h3, h4, p, span, li, svg) {
   color: inherit !important;
 }
+
+@keyframes toast-sheen {
+  0% {
+    transform: translate3d(-180%, 0, 0) rotate(18deg);
+    opacity: 0;
+  }
+
+  14% {
+    opacity: 0.34;
+  }
+
+  56% {
+    opacity: 0.08;
+  }
+
+  100% {
+    transform: translate3d(290%, 0, 0) rotate(18deg);
+    opacity: 0;
+  }
+}
+
+.cn-toast {
+  transform-origin: center top;
+}
+
+.cn-toast::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 16% 0%, rgba(255, 255, 255, 0.16), transparent 38%),
+    linear-gradient(135deg, rgba(125, 211, 252, 0.12), transparent 54%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 32%);
+  opacity: 0.9;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+
+.cn-toast::after {
+  content: "";
+  position: absolute;
+  top: -36%;
+  left: -24%;
+  width: 46%;
+  height: 210%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+  transform: translate3d(-180%, 0, 0) rotate(18deg);
+  opacity: 0;
+  pointer-events: none;
+  filter: blur(10px);
+  animation: toast-sheen 6.8s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+.cn-toast:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow:
+    0 28px 84px rgba(2, 6, 23, 0.52),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.cn-toast:hover .cn-toast-icon {
+  transform: translateY(-1px) scale(1.03);
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 12px 24px rgba(15, 23, 42, 0.18);
+}
+
+.cn-toast-content {
+  position: relative;
+  z-index: 1;
+}
+
+.cn-toast-title {
+  text-wrap: balance;
+}
+
+.cn-toast-description {
+  max-width: 42ch;
+}
+
+.cn-toast [data-content] + [data-button] {
+  margin-inline-start: auto;
+}
+
+.cn-toast [data-button] {
+  position: relative;
+  overflow: hidden;
+}
+
+.cn-toast [data-button]::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 60%);
+  pointer-events: none;
+}
+
+.cn-toast-action::after {
+  content: "";
+  position: absolute;
+  top: -64%;
+  left: -12%;
+  width: 52%;
+  height: 220%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+  transform: translate3d(-180%, 0, 0) rotate(24deg);
+  opacity: 0;
+  filter: blur(6px);
+}
+
+.cn-toast-action:hover::after {
+  opacity: 0.95;
+  animation: toast-sheen 1.2s cubic-bezier(0.22, 1, 0.36, 1) 1;
+}
+
+.cn-toast-success {
+  border-color: rgba(45, 212, 191, 0.22);
+  box-shadow:
+    0 24px 70px rgba(2, 6, 23, 0.42),
+    0 0 0 1px rgba(45, 212, 191, 0.06);
+}
+
+.cn-toast-success .cn-toast-icon {
+  border-color: rgba(45, 212, 191, 0.24);
+  background: linear-gradient(180deg, rgba(20, 184, 166, 0.22), rgba(13, 148, 136, 0.14));
+  color: #8ff3d9;
+}
+
+.cn-toast-info {
+  border-color: rgba(56, 189, 248, 0.22);
+  box-shadow:
+    0 24px 70px rgba(2, 6, 23, 0.42),
+    0 0 0 1px rgba(56, 189, 248, 0.06);
+}
+
+.cn-toast-info .cn-toast-icon,
+.cn-toast-loading .cn-toast-icon {
+  border-color: rgba(56, 189, 248, 0.24);
+  background: linear-gradient(180deg, rgba(14, 165, 233, 0.22), rgba(2, 132, 199, 0.14));
+  color: #8fdfff;
+}
+
+.cn-toast-warning {
+  border-color: rgba(251, 191, 36, 0.22);
+  box-shadow:
+    0 24px 70px rgba(2, 6, 23, 0.42),
+    0 0 0 1px rgba(251, 191, 36, 0.06);
+}
+
+.cn-toast-warning .cn-toast-icon {
+  border-color: rgba(251, 191, 36, 0.24);
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.22), rgba(217, 119, 6, 0.14));
+  color: #ffe08a;
+}
+
+.cn-toast-error {
+  border-color: rgba(251, 113, 133, 0.24);
+  box-shadow:
+    0 24px 70px rgba(2, 6, 23, 0.42),
+    0 0 0 1px rgba(251, 113, 133, 0.06);
+}
+
+.cn-toast-error .cn-toast-icon {
+  border-color: rgba(251, 113, 133, 0.26);
+  background: linear-gradient(180deg, rgba(244, 63, 94, 0.22), rgba(225, 29, 72, 0.14));
+  color: #ffb1bf;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cn-toast::after,
+  .cn-toast-action::after {
+    animation: none;
+  }
+
+  .cn-toast,
+  .cn-toast::before,
+  .cn-toast-icon,
+  .cn-toast [data-button] {
+    transition: none !important;
+  }
+}

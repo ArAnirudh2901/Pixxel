@@ -1,4 +1,4 @@
-import { useUser } from "@clerk/nextjs";
+import { useAuth, useUser } from "@clerk/nextjs";
 import { useConvexAuth } from "convex/react";
 import { useEffect, useState } from "react";
 import { useMutation } from "convex/react";
@@ -7,7 +7,9 @@ import { toast } from "sonner";
 
 export function useStoreUser() {
     const { isLoading, isAuthenticated } = useConvexAuth();
+    const { has } = useAuth();
     const { user } = useUser();
+    const isPro = has?.({ plan: "pro" }) || false;
     // When this state is set we know the server
     // has stored the user.
     const [userId, setUserId] = useState(null);
@@ -30,6 +32,18 @@ export function useStoreUser() {
         async function createUser() {
             try {
                 const id = await storeUser();
+
+                try {
+                    const response = await fetch("/api/billing/sync", {
+                        method: "POST",
+                    });
+
+                    if (!response.ok) {
+                        throw new Error("Billing plan sync failed.");
+                    }
+                } catch (syncError) {
+                    console.error("Failed to sync billing plan to Convex.", syncError);
+                }
 
                 if (!isCancelled) {
                     setUserId(id);
@@ -57,7 +71,7 @@ export function useStoreUser() {
         };
         // Make sure the effect reruns if the user logs in with
         // a different identity
-    }, [isAuthenticated, isLoading, storeUser, user?.id]);
+    }, [isAuthenticated, isLoading, isPro, storeUser, user?.id]);
     // Combine the local state with the state from context
     return {
         isLoading: isLoading || (isAuthenticated && userId === null),

@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
+import { getAuthUserId } from "./users";
 
 export const create = mutation({
     args: {
@@ -13,7 +14,7 @@ export const create = mutation({
         canvasState: v.optional(v.any())
     },
     handler: async (ctx, args) => {
-        const user = await ctx.runQuery(api.users.getCurrentUser, {});
+        const user = await getAuthUserId(ctx);
 
         if (user.plan === "free") {
             const projectCount = await ctx.db
@@ -51,7 +52,7 @@ export const create = mutation({
 export const getUserProjects = query({
     args: {},
     handler: async (ctx) => {
-        const user = await ctx.runQuery(api.users.getCurrentUser, {});
+        const user = await getAuthUserId(ctx);
 
         const projects = await ctx.db
             .query("projects")
@@ -68,7 +69,7 @@ export const deleteProject = mutation({
         projectId: v.id("projects"),
     },
     handler: async (ctx, args) => {
-        const user = await ctx.runQuery(api.users.getCurrentUser, {});
+        const user = await getAuthUserId(ctx);
 
         const project = await ctx.db.get(args.projectId);
 
@@ -90,3 +91,123 @@ export const deleteProject = mutation({
         return { success: true };
     },
 });
+
+export const bulkDeleteProjects = mutation({
+    args: {
+        projectIds: v.array(v.id("projects")),
+    },
+    handler: async (ctx, args) => {
+        const user = await getAuthUserId(ctx);
+        const uniqueProjectIds = [...new Set(args.projectIds)];
+
+        if (uniqueProjectIds.length === 0) {
+            return { success: true, deletedCount: 0 };
+        }
+
+        const ownedProjects = [];
+
+        for (const projectId of uniqueProjectIds) {
+            const project = await ctx.db.get(projectId);
+
+            if (!project) {
+                continue;
+            }
+
+            if (project.userId !== user._id) {
+                throw new Error("Access denied");
+            }
+
+            ownedProjects.push(project);
+        }
+
+        for (const project of ownedProjects) {
+            await ctx.db.delete(project._id);
+        }
+
+        if (ownedProjects.length > 0) {
+            await ctx.db.patch(user._id, {
+                projectsUsed: Math.max(0, user.projectsUsed - ownedProjects.length),
+                lastActiveAt: Date.now(),
+            });
+        }
+
+        return {
+            success: true,
+            deletedCount: ownedProjects.length,
+        };
+    },
+});
+
+export const getProject = query({
+    args: {
+        projectId: v.id("projects")
+    },
+    handler: async (ctx, args) => {
+        const user = await getAuthUserId(ctx)
+
+        const project = await ctx.db.get(args.projectId)
+        if (!project)
+            throw new Error("Project not found")
+
+        if (!user || project.userId !== user._id)
+            throw new Error("Access denied")
+
+        return project
+    }
+})
+
+export const updateProject = mutation({
+    args: {
+        projectId: v.id("projects"),
+        canvasState: v.optional(v.any()),
+        width: v.optional(v.number()),
+        height: v.optional(v.number()),
+        currentImageUrl: v.optional(v.string()),
+        thumbnailUrl: v.optional(v.string()),
+        activeTransformations: v.optional(v.string()),
+        backgroundRemoved: v.optional(v.boolean()),
+    },
+    handler: async (ctx, args) => {
+        const user = await getAuthUserId(ctx)
+
+        const project = await ctx.db.get(args.projectId)
+        if (!project)
+            throw new Error("Project not found")
+
+        if (!user || project.userId !== user._id)
+            throw new Error("Access denied")
+
+        const updateData = {
+            updatedAt: Date.now(),
+        }
+
+        if (args.canvasState !== undefined)
+            updateData.canvasState = args.canvasState
+
+        if (args.width !== undefined)
+            updateData.width = args.width
+
+        if (args.height !== undefined)
+            updateData.height = args.height
+
+        if (args.currentImageUrl !== undefined)
+            updateData.currentImageUrl = args.currentImageUrl
+
+        if (args.thumbnailUrl !== undefined)
+            updateData.thumbnailUrl = args.thumbnailUrl
+
+        if (args.activeTransformations !== undefined)
+            updateData.activeTransformations = args.activeTransformations
+
+        if (args.backgroundRemoved !== undefined)
+            updateData.backgroundRemoved = args.backgroundRemoved
+
+        await ctx.db.patch(args.projectId, updateData)
+
+        await ctx.db.patch(user._id, {
+            lastActiveAt: Date.now()
+        })
+
+        return args.projectId
+    }
+})
