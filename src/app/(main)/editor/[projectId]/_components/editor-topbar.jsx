@@ -1,6 +1,6 @@
 "use client"
 
-import { Bot, Beaker, Eraser, Expand, Eye, ImagePlus, Maximize2, Palette, PanelLeft, PanelRight, Pen, Scissors, Sliders, Text, Crop, ArrowLeft, ChevronDown, Check, Copy, Download, Loader2, Save, Undo2, Redo2, ZoomIn, Keyboard, LayoutGrid, AudioLines } from 'lucide-react'
+import { Bot, Eraser, Expand, Eye, ImagePlus, Maximize2, Palette, PanelLeft, PanelRight, Pen, Scissors, Sliders, Text, Crop, ArrowLeft, ChevronDown, Check, Copy, Download, Loader2, Save, Undo2, Redo2, ZoomIn, Keyboard, LayoutGrid, AudioLines } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -49,16 +49,7 @@ const TOOLS = [
     { id: "collage", label: "Collage", icon: LayoutGrid },
 ]
 
-// Dev-only tools are appended in `next.config.mjs`-stripped builds via a
-// NODE_ENV check. These IDs map 1:1 to entries in `TOOL_CONFIGS` in
-// `editor-sidebar.jsx`. Production trees never see them.
-const DEV_ONLY_TOOLS = process.env.NODE_ENV === 'production' ? [] : [
-    { id: "megashader_test", label: "Megashader", icon: Beaker, devOnly: true },
-]
-
-// The combined list is what the topbar iterates over. Order is preserved so
-// the Megashader button sits at the end of the bar (visually separated).
-const ALL_TOOLS = [...TOOLS, ...DEV_ONLY_TOOLS]
+const ALL_TOOLS = [...TOOLS]
 
 const EditorTopbar = ({ project, onToggleSidebar, isSidebarOpen = false, isNarrowViewport = false }) => {
 

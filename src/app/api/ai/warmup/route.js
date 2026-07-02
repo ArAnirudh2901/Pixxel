@@ -18,19 +18,20 @@ export const runtime = 'nodejs'
  * No auth required — warmup is idempotent and free (just loads models).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-const MASK_SERVICE_URL = process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
+const MASKING_SERVICE_URL = process.env.MASKING_SERVICE_URL?.trim().replace(/\/+$/, '')
+  || process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
 
 export async function POST() {
-  if (!MASK_SERVICE_URL) {
+  if (!MASKING_SERVICE_URL) {
     return NextResponse.json(
-      { status: 'skipped', reason: 'MASK_SERVICE_URL not configured' },
+      { status: 'skipped', reason: 'MASKING_SERVICE_URL not configured' },
       { status: 200 },
     )
   }
 
   try {
     // First check if the service is up at all
-    const healthResp = await fetch(`${MASK_SERVICE_URL}/health`, {
+    const healthResp = await fetch(`${MASKING_SERVICE_URL}/health`, {
       signal: AbortSignal.timeout(5000),
     })
     if (!healthResp.ok) {
@@ -45,15 +46,14 @@ export async function POST() {
     const allLoaded =
       health.sam2_loaded &&
       health.depth_loaded &&
-      health.ground_loaded &&
-      health.lama_loaded
+      health.ground_loaded
     if (allLoaded) {
       return NextResponse.json({ status: 'already_warm', models: health })
     }
 
     // Trigger warmup — this can take 1–3 minutes on cold start
-    console.info('[ai-warmup] triggering warmup at', MASK_SERVICE_URL)
-    const warmupResp = await fetch(`${MASK_SERVICE_URL}/warmup`, {
+    console.info('[ai-warmup] triggering warmup at', MASKING_SERVICE_URL)
+    const warmupResp = await fetch(`${MASKING_SERVICE_URL}/warmup`, {
       method: 'POST',
       signal: AbortSignal.timeout(290_000), // just under maxDuration
     })
@@ -80,7 +80,7 @@ export async function POST() {
 
 // GET for simple health probes
 export async function GET() {
-  if (!MASK_SERVICE_URL) {
+  if (!MASKING_SERVICE_URL) {
     return NextResponse.json({
       configured: false,
       status: 'not_configured',
@@ -88,7 +88,7 @@ export async function GET() {
   }
 
   try {
-    const resp = await fetch(`${MASK_SERVICE_URL}/health`, {
+    const resp = await fetch(`${MASKING_SERVICE_URL}/health`, {
       signal: AbortSignal.timeout(5000),
     })
     if (!resp.ok) {
@@ -99,16 +99,15 @@ export async function GET() {
       configured: true,
       status: 'ok',
       modelsLoaded: {
+        sam3: health.sam3_loaded || false,
         sam2: health.sam2_loaded || false,
         depth: health.depth_loaded || false,
         ground: health.ground_loaded || false,
-        lama: health.lama_loaded || false,
       },
       allWarm: Boolean(
         health.sam2_loaded &&
         health.depth_loaded &&
-        health.ground_loaded &&
-        health.lama_loaded,
+        health.ground_loaded,
       ),
     })
   } catch {

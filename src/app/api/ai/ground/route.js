@@ -16,7 +16,7 @@ export const runtime = 'nodejs'
  * (src/lib/agent/nl-mask.js) calls this for open-vocabulary targets that
  * instance detection (/api/ai/segment-instances) can't name.
  *
- * Returns 501 when MASK_SERVICE_URL is unset — exactly like sam2/depth/
+ * Returns 501 when MASKING_SERVICE_URL is unset — exactly like sam2/depth/
  * segment-instances. No HuggingFace fallback.
  *
  * Request (multipart/form-data):
@@ -29,7 +29,10 @@ export const runtime = 'nodejs'
  * scaled — back to the ORIGINAL image resolution.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-const MASK_SERVICE_URL = process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
+// Masking microservice (own HF Space); falls back to the legacy shared
+// MASK_SERVICE_URL so existing single-service deploys keep working.
+const MASKING_SERVICE_URL = process.env.MASKING_SERVICE_URL?.trim().replace(/\/+$/, '')
+  || process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
 const MAX_INPUT_BYTES = 24 * 1024 * 1024
 const MAX_MODEL_SIDE = 2048
 
@@ -77,9 +80,9 @@ export async function POST(request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    if (!MASK_SERVICE_URL) {
+    if (!MASKING_SERVICE_URL) {
       return NextResponse.json(
-        { error: 'MASK_SERVICE_URL is not configured — text grounding requires the local mask service (bun run mask:dev)' },
+        { error: 'MASKING_SERVICE_URL is not configured — text grounding requires the masking service (bun run masking:dev)' },
         { status: 501 },
       )
     }
@@ -133,7 +136,7 @@ export async function POST(request) {
       serviceForm.append('refine', refine.trim())
     }
 
-    const response = await fetch(`${MASK_SERVICE_URL}/ground/text`, {
+    const response = await fetch(`${MASKING_SERVICE_URL}/ground/text`, {
       method: 'POST',
       body: serviceForm,
       // First call lazy-loads CLIPSeg (+ SAM 2 for refinement) on the service.

@@ -20,6 +20,7 @@ import { buildPackedLutFromCurves } from '@/lib/curve-lut'
 import { expandLayerBoundary } from '@/lib/mask-grow'
 import { AI_CAPABILITIES, getRoutingPolicy, resetRoutingPolicy, setRoutingMode, subscribeRouting } from '@/lib/ai-routing'
 import { getClientAIState, runClientAISelfTest, subscribeClientAI } from '@/lib/client-ai'
+import { checkMaskService, decodeMaskBlob, base64PngToBlob, prepareImageBlob } from '@/lib/mask-service-client'
 import { computeGradientMagnitude, snapToEdgePoint } from '@/lib/mask-edge-snap'
 import {
     BrushSizeControl,
@@ -595,6 +596,26 @@ const MaskControls = ({ dominantColor }) => {
     const boxDraftRef = useRef(/** @type {{x:number,y:number} | null} */ (null))
     const boxRectRef = useRef(/** @type {any} */ (null))
 
+    // Masking-service (SAM 3.1) availability — probed once via the same-origin
+    // /api/ai/health proxy. Drives the badge + graceful "on-device" messaging;
+    // fails soft to 'offline' (the tool still works via server/on-device AI).
+    const [maskService, setMaskService] = useState(/** @type {{status:string,sam3?:boolean,model?:string}} */({ status: 'unchecked' }))
+    useEffect(() => {
+        let alive = true
+        ;(async () => {
+            const s = await checkMaskService()
+            if (alive) setMaskService(s?.available
+                ? { status: 'available', sam3: !!s.sam3, model: s.model || '' }
+                : { status: 'offline' })
+        })()
+        return () => { alive = false }
+    }, [])
+
+    // AI Background selection state (independent from Select Subject).
+    const [isSelectingBg, setIsSelectingBg] = useState(false)
+    const isSelectingBgRef = useRef(false)
+    const bgAbortRef = useRef(/** @type {AbortController | null} */(null))
+
     const handleSemanticClick = useCallback((e) => {
         if (!semanticActive || !tool.mainImage) return
         if (boxArmedRef.current) return // a box drag owns the pointer right now
@@ -779,32 +800,8 @@ const MaskControls = ({ dominantColor }) => {
     }, [])
 
     // Decode a Blob (PNG) to an HTMLImageElement + ImageData. The
-    // ImageData is what we store in the mask texture cache; the
-    // HTMLImageElement is what we draw to a 2D canvas to get the
-    // ImageData (canvas can't read PNGs directly). We return both so
-    // the caller can also produce a small preview data URL.
-    const decodeMaskBlob = useCallback(async (blob) => {
-        const objectUrl = URL.createObjectURL(blob)
-        try {
-            const img = await new Promise((resolve, reject) => {
-                const image = new Image()
-                image.crossOrigin = 'anonymous'
-                image.onload = () => resolve(image)
-                image.onerror = () => reject(new Error('Failed to decode mask PNG'))
-                image.src = objectUrl
-            })
-            const c = document.createElement('canvas')
-            c.width = img.naturalWidth || img.width
-            c.height = img.naturalHeight || img.height
-            const ctx = c.getContext('2d', { willReadFrequently: true })
-            if (!ctx) throw new Error('Could not get 2D context for mask decode')
-            ctx.drawImage(img, 0, 0)
-            const imageData = ctx.getImageData(0, 0, c.width, c.height)
-            return { imageData, width: c.width, height: c.height, dataUrl: c.toDataURL('image/png') }
-        } finally {
-            URL.revokeObjectURL(objectUrl)
-        }
-    }, [])
+    // decodeMaskBlob / base64PngToBlob / prepareImageBlob are imported from
+    // @/lib/mask-service-client (single implementation, testable).
 
     const handleSemanticRun = useCallback(async () => {
         if (!tool.mainImage) return
@@ -918,7 +915,24 @@ const MaskControls = ({ dominantColor }) => {
                 setIsSemanticRunning(false)
             }
         }
-    }, [tool, semanticClicks, semanticBox, decodeMaskBlob])
+    }, [tool, semanticClicks, semanticBox])
+
+    // Live click/box selection: run SAM the moment a click lands or a box is
+    // drawn, so the mask refines per interaction (the "Run" button stays as a
+    // manual re-run). A short debounce coalesces rapid clicks into one call with
+    // ALL accumulated points; re-firing on isSemanticRunning picks up clicks
+    // added mid-run; the signature ref stops an idempotent re-run loop.
+    const liveRunSigRef = useRef(/** @type {string | null} */(null))
+    useEffect(() => {
+        if (!semanticActive) { liveRunSigRef.current = null; return }
+        if (semanticClicks.length === 0 && !semanticBox) { liveRunSigRef.current = null; return }
+        if (isSemanticRunning) return
+        const sig = JSON.stringify([semanticClicks, semanticBox])
+        if (sig === liveRunSigRef.current) return
+        const t = setTimeout(() => { liveRunSigRef.current = sig; handleSemanticRun() }, 110)
+        return () => clearTimeout(t)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [semanticClicks, semanticBox, semanticActive, isSemanticRunning])
 
     // Add the most recent decoded mask as a megashader layer. The
     // texture is stored in the module-level mask cache under a freshly
@@ -1039,7 +1053,7 @@ const MaskControls = ({ dominantColor }) => {
                 setIsDepthRunning(false)
             }
         }
-    }, [tool, decodeMaskBlob])
+    }, [tool])
 
     // Add the most recent depth map as a megashader layer with the user's
     // current min/max/softness. The texture lives in the same module-level
@@ -2532,7 +2546,57 @@ const MaskControls = ({ dominantColor }) => {
                 setIsSegmenting(false)
             }
         }
-    }, [tool, decodeMaskBlob, applySubjectSelection])
+    }, [tool, applySubjectSelection])
+
+    // AI Background — detect the subject, then INVERT it. Foreground/background
+    // separation (not text grounding) is the only reliable "whole sky/background"
+    // select. Adds its own layer, kept separate from the Subject layer.
+    const handleSelectBackground = useCallback(async () => {
+        if (!tool.mainImage) return
+        if (isSelectingBgRef.current) return
+        try { bgAbortRef.current?.abort() } catch { /* ignore */ }
+        const abortController = new AbortController()
+        bgAbortRef.current = abortController
+        isSelectingBgRef.current = true
+        setIsSelectingBg(true)
+        try {
+            const fabricObj = tool.mainImage
+            const sourceEl = fabricObj?._element || fabricObj?.getElement?.()
+            if (!sourceEl) throw new Error('Cannot access image element')
+            const { blob } = await prepareImageBlob(sourceEl, { maxSide: 2048, quality: 0.92 })
+            const form = new FormData()
+            form.append('image', blob, 'image.jpg')
+            const resp = await fetch('/api/ai/segment', { method: 'POST', body: form, signal: abortController.signal })
+            if (!resp.ok) {
+                const errJson = await resp.json().catch(() => ({}))
+                throw new Error(errJson.error || `Segmentation failed (${resp.status})`)
+            }
+            const maskBlob = await resp.blob()
+            if (bgAbortRef.current !== abortController) return
+            const decoded = await decodeMaskBlob(maskBlob)
+            if (bgAbortRef.current !== abortController) return
+            // invert subject coverage → everything that ISN'T the subject
+            const d = decoded.imageData.data
+            for (let i = 0; i < d.length; i += 4) {
+                const v = 255 - d[i]
+                d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255
+            }
+            const key = `background-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+            setMaskTexture(key, decoded.imageData)
+            const id = addChainLayer('semantic', { maskTextureKey: key, feather: 0.1, label: 'AI Background' })
+            if (id) toast.success('Background selected — everything except the subject.')
+            else toast.error('Could not create background selection')
+        } catch (err) {
+            if (err?.name === 'AbortError') return
+            console.error('[mask] AI background selection failed:', err)
+            toast.error(err?.message || 'AI background selection failed')
+        } finally {
+            if (bgAbortRef.current === abortController) {
+                isSelectingBgRef.current = false
+                setIsSelectingBg(false)
+            }
+        }
+    }, [tool, addChainLayer])
 
     /* ─── Multi-Subject Detection (Detect All Subjects) ──────────────────────
      * Calls /api/ai/segment-instances to enumerate every subject in the image
@@ -2540,14 +2604,6 @@ const MaskControls = ({ dominantColor }) => {
      * click. Results are cached on the Fabric image (one detection pass per
      * image) so re-clicking individual subjects is free.
      */
-    const base64PngToBlob = useCallback((b64) => {
-        const bin = atob(b64)
-        const len = bin.length
-        const arr = new Uint8Array(len)
-        for (let i = 0; i < len; i++) arr[i] = bin.charCodeAt(i)
-        return new Blob([arr], { type: 'image/png' })
-    }, [])
-
     const handleDetectAllSubjects = useCallback(async () => {
         if (!tool.mainImage) return
         if (isDetectingInstancesRef.current) return
@@ -2621,7 +2677,7 @@ const MaskControls = ({ dominantColor }) => {
                 setIsDetectingInstances(false)
             }
         }
-    }, [tool, base64PngToBlob, decodeMaskBlob, applySubjectSelection])
+    }, [tool, applySubjectSelection])
 
     const handleApplyInstance = useCallback(async (instance) => {
         if (!tool.mainImage || !instance?.maskPng) return
@@ -2640,7 +2696,7 @@ const MaskControls = ({ dominantColor }) => {
             console.error('[mask] apply-instance failed:', err)
             toast.error('Could not create subject selection')
         }
-    }, [tool, base64PngToBlob, decodeMaskBlob, applySubjectSelection])
+    }, [tool, applySubjectSelection])
 
     const handleApplyAllSubjectsUnion = useCallback(async () => {
         if (!tool.mainImage) return
@@ -2662,7 +2718,7 @@ const MaskControls = ({ dominantColor }) => {
                 toast.error('Could not create union selection')
             }
         }
-    }, [tool, subjectInstances, base64PngToBlob, decodeMaskBlob, applySubjectSelection])
+    }, [tool, subjectInstances, applySubjectSelection])
 
     // Invalidate the multi-subject cache when the user switches to a
     // different image so the chips don't show stale data.
@@ -2959,6 +3015,15 @@ const MaskControls = ({ dominantColor }) => {
 
             <CategoryHeader label="AI Tools" />
 
+            <div className="px-1 -mt-1 mb-1 flex items-center gap-1.5 text-[10px]" style={{ color: 'var(--text-muted)' }} title="Masking microservice (SAM 3.1) status">
+                <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: maskService.status === 'available' ? '#22c55e' : maskService.status === 'offline' ? '#f59e0b' : '#6b7280' }} />
+                {maskService.status === 'available'
+                    ? (maskService.sam3 ? 'Masking service · SAM 3.1 ready' : 'Masking service online')
+                    : maskService.status === 'offline'
+                        ? 'Masking service offline — using on-device AI'
+                        : 'Checking masking service…'}
+            </div>
+
             {/* AI processing routing: per-capability choice of where each AI
                 function runs — Auto (server first, device fallback), Device
                 (in-browser models via transformers.js, downloaded once and
@@ -3090,6 +3155,31 @@ const MaskControls = ({ dominantColor }) => {
                 <p className="text-[10px] text-center" style={{ color: 'var(--text-muted)' }}>
                     AI selects the main subject as a layer — background stays intact
                 </p>
+
+                <motion.button
+                    type="button"
+                    onClick={handleSelectBackground}
+                    disabled={isSelectingBg}
+                    whileTap={{ scale: 0.97 }}
+                    className="mask-btn w-full py-2 text-[11px] font-semibold"
+                    style={{
+                        background: 'rgba(6,184,212,0.10)',
+                        border: '1px solid rgba(6,184,212,0.30)',
+                        color: 'var(--accent-primary)',
+                    }}
+                >
+                    {isSelectingBg ? (
+                        <>
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            Selecting Background…
+                        </>
+                    ) : (
+                        <>
+                            <Layers className="h-3.5 w-3.5" />
+                            Select Background / Sky
+                        </>
+                    )}
+                </motion.button>
 
                 {/* ── Multi-subject: per-instance picker ────────────────── */}
                 <motion.button

@@ -1,0 +1,32 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pillow>=10.0.0
+numpy>=1.24
+scipy>=1.10
+
+# rembg backend for /segment saliency fallback (BiRefNet/ISNet ONNX).
+#   rembg[cpu] -> onnxruntime (CoreML EP auto on Apple Silicon)
+#   rembg[gpu] -> onnxruntime-gpu (CUDA on NVIDIA; Linux only)
+rembg[cpu]>=2.0.59
+
+# SAM 2 (/sam2/click box+point), Depth Anything V2 (/depth), CLIPSeg
+# (/ground/text fallback), SAM 3 backbone. Heavy (~2 GB) but required.
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.45.0
+
+# cv2 for clean_matte / matting refine / SAM 3 image ops.
+opencv-python-headless>=4.8
+
+# SAM 3.1 — primary subject / instance / text-grounding engine (SAM3_ENABLE=1).
+# Gated, not on PyPI — install from Meta's GitHub + authenticate:
+#   pip install "git+https://github.com/facebookresearch/sam3.git"
+#   hf auth login        # account must be approved at hf.co/facebook/sam3.1
+# On non-CUDA hosts main.py installs a CPU triton stub so the import succeeds
+# and inference runs on CPU. Undeclared SAM 3 runtime dep:
+pycocotools>=2.0.7
+
+# Alpha matting for SAM3_REFINE_MATTING (hair-level edges); cv2 guided-filter
+# is the fallback when absent.
+pymatting>=1.1

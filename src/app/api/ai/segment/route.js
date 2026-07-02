@@ -33,7 +33,10 @@ const MAX_MODEL_SIDE = 2048
  * later adds RMBG support, the loop can be reintroduced here.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-const MASK_SERVICE_URL = process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
+// Masking microservice (own HF Space); falls back to the legacy shared
+// MASK_SERVICE_URL so existing single-service deploys keep working.
+const MASKING_SERVICE_URL = process.env.MASKING_SERVICE_URL?.trim().replace(/\/+$/, '')
+  || process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
 const HF_ENDPOINTS = [
   'https://router.huggingface.co/hf-inference/models',
   'https://api-inference.huggingface.co/models',
@@ -116,9 +119,9 @@ const refineMaskEdges = async (greyBuffer, modelW, modelH, origW, origH, { binar
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const callLocalMaskService = async (imageBuffer) => {
-  if (!MASK_SERVICE_URL) return null
+  if (!MASKING_SERVICE_URL) return null
 
-  const endpoint = `${MASK_SERVICE_URL}/segment`
+  const endpoint = `${MASKING_SERVICE_URL}/segment`
   try {
     console.info('[ai-segment] trying local mask service:', endpoint)
     const formData = new FormData()

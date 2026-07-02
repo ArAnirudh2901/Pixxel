@@ -34,7 +34,10 @@ export const runtime = 'nodejs'
  *   - X-Elapsed-Ms
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-const MASK_SERVICE_URL = process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
+// Masking microservice (own HF Space); falls back to the legacy shared
+// MASK_SERVICE_URL so existing single-service deploys keep working.
+const MASKING_SERVICE_URL = process.env.MASKING_SERVICE_URL?.trim().replace(/\/+$/, '')
+  || process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
 const MAX_INPUT_BYTES = 24 * 1024 * 1024
 const MAX_CLICKS = 50
 const MAX_MODEL_SIDE = 1024
@@ -166,10 +169,10 @@ const refineMaskEdges = async (pngBuffer, modelW, modelH, origW, origH) => {
 }
 
 const callSam2Service = async (imageBuffer, clicks, box = null) => {
-  if (!MASK_SERVICE_URL) {
-    return { ok: false, reason: 'MASK_SERVICE_URL not configured' }
+  if (!MASKING_SERVICE_URL) {
+    return { ok: false, reason: 'MASKING_SERVICE_URL not configured' }
   }
-  const endpoint = `${MASK_SERVICE_URL}/sam2/click`
+  const endpoint = `${MASKING_SERVICE_URL}/sam2/click`
   try {
     const formData = new FormData()
     formData.append('image', new Blob([imageBuffer], { type: 'image/jpeg' }), 'image.jpg')
@@ -226,9 +229,9 @@ export async function POST(request) {
     const limited = rateLimitResponse(await enforceRateLimit('ai-sam2', userId))
     if (limited) return limited
 
-    if (!MASK_SERVICE_URL) {
+    if (!MASKING_SERVICE_URL) {
       return NextResponse.json(
-        { error: 'MASK_SERVICE_URL is not configured. Start services/segment/main.py and set MASK_SERVICE_URL in .env.local.' },
+        { error: 'MASKING_SERVICE_URL is not configured. Start services/masking/main.py (bun run masking:dev) and set MASKING_SERVICE_URL in .env.local.' },
         { status: 501 },
       )
     }

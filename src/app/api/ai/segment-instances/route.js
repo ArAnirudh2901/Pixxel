@@ -18,11 +18,14 @@ export const runtime = 'nodejs'
  * "person 2" or "the dog" individually.
  *
  * No HuggingFace fallback: per-instance segmentation requires the local
- * YOLO-seg + BiRefNet stack. Without MASK_SERVICE_URL this returns 501,
+ * YOLO-seg + BiRefNet stack. Without MASKING_SERVICE_URL this returns 501,
  * matching /api/ai/sam2 and /api/ai/depth.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-const MASK_SERVICE_URL = process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
+// Masking microservice (own HF Space); falls back to the legacy shared
+// MASK_SERVICE_URL so existing single-service deploys keep working.
+const MASKING_SERVICE_URL = process.env.MASKING_SERVICE_URL?.trim().replace(/\/+$/, '')
+  || process.env.MASK_SERVICE_URL?.trim().replace(/\/+$/, '') || ''
 
 const MAX_INPUT_BYTES = 24 * 1024 * 1024
 // Mirrors /api/ai/segment: BiRefNet runs at a fixed 1024² internally, but a
@@ -82,9 +85,9 @@ export async function POST(request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    if (!MASK_SERVICE_URL) {
+    if (!MASKING_SERVICE_URL) {
       return NextResponse.json(
-        { error: 'MASK_SERVICE_URL is not configured — multi-subject selection requires the local mask service (bun run mask:dev)' },
+        { error: 'MASKING_SERVICE_URL is not configured — multi-subject selection requires the masking service (bun run masking:dev)' },
         { status: 501 },
       )
     }
@@ -115,7 +118,7 @@ export async function POST(request) {
     const serviceForm = new FormData()
     serviceForm.append('image', new Blob([prepared.buffer], { type: 'image/jpeg' }), 'image.jpg')
 
-    const response = await fetch(`${MASK_SERVICE_URL}/segment/instances`, {
+    const response = await fetch(`${MASKING_SERVICE_URL}/segment/instances`, {
       method: 'POST',
       body: serviceForm,
       // Same budget as /api/ai/segment: covers a cold CPU BiRefNet run plus

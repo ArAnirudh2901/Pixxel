@@ -30,7 +30,9 @@
     "verify:inpaint": "bun scripts/verify-inpaint.mjs",
     "verify:history": "node scripts/verify-history-journal.mjs",
     "mask:install": "pip install -r services/segment/requirements.txt",
-    "mask:dev": "python services/segment/main.py"
+    "mask:dev": "python services/segment/main.py",
+    "masking:install": "pip install -r services/masking/requirements.txt",
+    "masking:dev": "python services/masking/main.py"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.0.6",
