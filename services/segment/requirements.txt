@@ -9,7 +9,11 @@ pillow>=10.0.0
 # Default is `cpu` (cross-platform). Override with one of:
 #   pip install -U "rembg[gpu]"     # Linux + NVIDIA
 #   pip install -U "rembg[cpu]"     # macOS / Windows / Linux CPU
-rembg[cpu]>=2.0.59
+# <2.0.70: 2.0.70+ needs numpy>=2.3, breaks sam3's numpy<2 (shared global env, no venv).
+rembg[cpu]>=2.0.59,<2.0.70
+
+# <2 required by sam3; raising rembg/opencv floors past their ceilings pulls numpy 2.x -> sam3 breaks.
+numpy>=1.26,<2
 
 # Step 5: SAM 2 click-to-select semantic masking.
 # Optional — only needed for the /sam2/click endpoint. If absent, the
@@ -44,7 +48,8 @@ simple-lama-inpainting>=0.1.0
 # real triton is used and the stub is a no-op.
 # These two are runtime deps sam3 needs but does NOT declare in its metadata:
 pycocotools>=2.0.7          # sam3.train.data COCO loaders (pulled in transitively)
-opencv-python-headless>=4.8 # cv2, used across sam3 image ops
+opencv-python-headless>=4.8,<4.11 # cv2, used across sam3 image ops; <4.11 keeps numpy<2
+einops>=0.7                 # sam3.sam.rope imports it; undeclared in metadata
 # Alpha matting for SAM3_REFINE_MATTING (hair-level edge refinement). The
 # PyMatting closed-form solver is the quality path; the cv2 guided-filter
 # fallback needs only opencv. scipy/numpy come transitively.
