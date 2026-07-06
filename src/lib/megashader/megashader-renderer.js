@@ -27,7 +27,7 @@
 
 import { compileMegashader } from './megashader-compiler'
 import { getKindSchema, normaliseUniformValue } from './glsl-mask-kinds'
-import { getMaskTexture, stackHasNoVisibleEffect, fillModeToFloat } from './mask-types'
+import { getMaskTexture, getMaskTextureVersion, stackHasNoVisibleEffect, fillModeToFloat } from './mask-types'
 
 const MAX_PROGRAM_CACHE = 64
 
@@ -113,6 +113,14 @@ void main() {
 let glContext = null
 let glCanvas = null
 let programCache = /** @type {Map<string, WebGLProgram>} */ (new Map())
+// Persistent GL texture cache for mask/LUT uploads (Cluster A change 1).
+// Keyed by the mask-texture cache key; each entry records the GL texture and
+// the data VERSION it was uploaded from (see getMaskTextureVersion). Reused
+// across frames; re-uploaded only on a version bump. LRU-capped well above
+// the <=16 textures any single frame can bind, so eviction never removes a
+// texture that was bound earlier in the current frame.
+let maskGlTextureCache = /** @type {Map<string, { tex: WebGLTexture, version: number }>} */ (new Map())
+const MAX_MASK_GL_TEXTURES = 64
 let quadProgram = /** @type {WebGLProgram | null} */ (null)
 let quadVbo = /** @type {WebGLBuffer | null} */ (null)
 let quadVao = /** @type {WebGLVertexArrayObject | null} */ (null)
@@ -582,6 +590,72 @@ const writeUniforms = (gl, program, stack, renderOpts, imageSize, textureBinding
 }
 
 /**
+ * Bind a cached GL texture for a mask/LUT `key` to the currently-active
+ * texture unit, (re)uploading ONLY when the key's data VERSION changed since
+ * the last upload. `setMaskTexture` bumps that version on every write (brush
+ * stroke, boundary grow, AI mask, curve LUT, undo/redo restore), so a version
+ * mismatch is the exact, complete signal that the pixels changed — a match
+ * proves they are byte-identical and the cached texture is still correct.
+ * `gl.isTexture` guards against a context-loss-invalidated handle (forces a
+ * fresh upload). Returns true if a texture is bound to the active unit.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {string} key
+ * @param {*} data            Cached texture source (already resolved by caller).
+ * @param {boolean} flipY     UNPACK_FLIP_Y_WEBGL for the upload.
+ * @param {GLenum} filter     gl.LINEAR or gl.NEAREST (min+mag).
+ * @returns {boolean}
+ */
+const bindCachedMaskTexture = (gl, key, data, flipY, filter) => {
+    const version = getMaskTextureVersion(key)
+    const entry = maskGlTextureCache.get(key)
+    if (entry && entry.version === version && gl.isTexture(entry.tex)) {
+        // Reuse: pixels unchanged (version match) and the GL texture is valid.
+        // Bind only — no re-upload. Refresh LRU recency (move to tail) so a
+        // texture used this frame is never the eviction target.
+        gl.bindTexture(gl.TEXTURE_2D, entry.tex)
+        maskGlTextureCache.delete(key)
+        maskGlTextureCache.set(key, entry)
+        return true
+    }
+    // Miss or stale version → (re)upload. Delete the stale GL texture first.
+    if (entry && entry.tex && gl.isTexture(entry.tex)) gl.deleteTexture(entry.tex)
+    const tex = gl.createTexture()
+    if (!tex) { maskGlTextureCache.delete(key); return false }
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flipY)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    try {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, /** @type {any} */ (data))
+    } catch {
+        // texImage2D can throw on malformed data (e.g. ImageBitmap without the
+        // right colour space). Drop the texture; caller binds the null texture.
+        gl.deleteTexture(tex)
+        maskGlTextureCache.delete(key)
+        return false
+    }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    maskGlTextureCache.set(key, { tex, version })
+    // Evict least-recently-used orphans beyond the cap. Never evict `key`
+    // (just uploaded) or any key already bound this frame — with the cap
+    // (64) far above the <=16 textures a frame can bind, the eviction front
+    // only holds stale keys from earlier frames.
+    if (maskGlTextureCache.size > MAX_MASK_GL_TEXTURES) {
+        for (const oldKey of [...maskGlTextureCache.keys()]) {
+            if (maskGlTextureCache.size <= MAX_MASK_GL_TEXTURES) break
+            if (oldKey === key) continue
+            const old = maskGlTextureCache.get(oldKey)
+            if (old && old.tex && gl.isTexture(old.tex)) gl.deleteTexture(old.tex)
+            maskGlTextureCache.delete(oldKey)
+        }
+    }
+    return true
+}
+
+/**
  * Upload per-layer image textures (semantic masks, depth maps, future
  * kinds) and bind them to unique texture units. Returns a
  * `textureBindings` object the `writeUniforms` consumer uses to wire
@@ -683,49 +757,20 @@ const bindKindTextures = (gl, stack) => {
             if (u >= 0) kindUnits.set(i, u)
             continue
         }
-        const tex = gl.createTexture()
-        if (!tex) {
-            const u = ensureNullUnit()
-            if (u >= 0) kindUnits.set(i, u)
-            continue
-        }
         gl.activeTexture(gl.TEXTURE0 + nextUnit)
-        gl.bindTexture(gl.TEXTURE_2D, tex)
-        // Y-flip kind textures on upload. The source image is uploaded with
-        // UNPACK_FLIP_Y_WEBGL = true (canvas-Y-down → GL-Y-up), so the GLSL
-        // samples `uImage` at `vTextureCoord` (0,0 = bottom-left) and the
-        // brush/semantic/depth textures must be uploaded the same way. Without
-        // this, the brush would appear vertically inverted relative to the
-        // underlying photo (it would sit above where the user painted instead
-        // of on it). This was the cause of "the mask is offset from the
-        // stroke" / "the brush doesn't line up".
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
-        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
-        try {
-            gl.texImage2D(
-                gl.TEXTURE_2D,
-                0,
-                gl.RGBA,
-                gl.RGBA,
-                gl.UNSIGNED_BYTE,
-                /** @type {any} */ (data),
-            )
-        } catch {
-            // texImage2D can throw on malformed data (e.g. ImageBitmap
-            // without the right colour space). Drop the texture and bind
-            // the null texture so the layer reads alpha 0 (Bug #8) rather
+        // Persistent GL texture cache: (re)upload only when this key's data
+        // VERSION changed (setMaskTexture bumps it on every write); otherwise
+        // reuse the cached GL texture and just bind it. Kind textures are
+        // Y-flipped (to match the source's UNPACK_FLIP_Y) and LINEAR-filtered.
+        if (!bindCachedMaskTexture(gl, cacheKey, data, true, gl.LINEAR)) {
+            // createTexture / texImage2D failed (malformed data) → bind the
+            // shared null texture so the layer reads alpha 0 (Bug #8) rather
             // than sampling the source image on unit 0.
-            gl.deleteTexture(tex)
             const u = ensureNullUnit()
             if (u >= 0) kindUnits.set(i, u)
             continue
         }
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
         kindUnits.set(i, nextUnit)
-        ownedTextures.push(tex)
         nextUnit += 1
         if (nextUnit >= 16) {
             // WebGL2 guarantees at least 16. We stop allocating rather
@@ -749,26 +794,13 @@ const bindKindTextures = (gl, stack) => {
         if (!key) continue
         const lut = getMaskTexture(key)
         if (!lut) continue
-        const tex = gl.createTexture()
-        if (!tex) continue
         gl.activeTexture(gl.TEXTURE0 + nextUnit)
-        gl.bindTexture(gl.TEXTURE_2D, tex)
-        // No Y-flip (1px tall) and no premultiply — the LUT is data, not an image.
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
-        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
-        try {
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, /** @type {any} */ (lut))
-        } catch {
-            gl.deleteTexture(tex)
-            continue
-        }
-        // LINEAR so values between the 256 entries interpolate; CLAMP at the ends.
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        // Same persistent cache as the kind textures. The LUT is data (256×1):
+        // no Y-flip, LINEAR so values between the 256 entries interpolate. The
+        // key is the stable `curve-<id>`; setMaskTexture bumps its version each
+        // time the user edits the curve, forcing a re-upload — otherwise reuse.
+        if (!bindCachedMaskTexture(gl, key, lut, false, gl.LINEAR)) continue
         curveUnits.set(i, nextUnit)
-        ownedTextures.push(tex)
         nextUnit += 1
     }
 
@@ -1072,7 +1104,11 @@ export const disposeRenderer = () => {
         if (quadProgram) gl.deleteProgram(quadProgram)
         if (quadVbo) gl.deleteBuffer(quadVbo)
         if (quadVao) gl.deleteVertexArray(quadVao)
+        for (const entry of maskGlTextureCache.values()) {
+            if (entry && entry.tex && gl.isTexture(entry.tex)) gl.deleteTexture(entry.tex)
+        }
     }
+    maskGlTextureCache = new Map()
     programCache.clear()
     quadProgram = null
     quadVbo = null

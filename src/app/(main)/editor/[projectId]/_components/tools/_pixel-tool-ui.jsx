@@ -768,7 +768,7 @@ function BoundaryGrowControl({ layer, locked, onCommit }) {
     )
 }
 
-export function MaskChainCard({
+export const MaskChainCard = React.memo(function MaskChainCard({
     entry, index, total, isFirst,
     onUpdate, onRemove, onMove, onSetOp, onSetFillMode,
     selected, onSelect,
@@ -1014,7 +1014,7 @@ export function MaskChainCard({
             </AnimatePresence>
         </motion.div>
     )
-}
+})
 
 /**
  * Lightroom-style 256-bucket luminance histogram with the min/max range

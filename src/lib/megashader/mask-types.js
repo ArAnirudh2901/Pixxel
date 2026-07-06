@@ -763,9 +763,40 @@ const maskTextureCache = new Map()
  * @param {string} key
  * @param {ImageData | HTMLCanvasElement | HTMLImageElement | ImageBitmap} data
  */
+/**
+ * Per-key content VERSION for the persistent GL texture cache in
+ * `megashader-renderer.js`. `setMaskTexture` is the single write path for
+ * mask/LUT pixels (brush stroke, boundary grow, AI mask, curve LUT,
+ * undo/redo restore), so bumping the version here — on EVERY write — is the
+ * exact, complete signal that a key's pixels changed. The renderer re-uploads
+ * only on a version change and reuses the cached GL texture otherwise, so a
+ * stale texture can never be served: any pixel change goes through here and
+ * increments the counter. The counter is monotonic (never reset, even across
+ * clearMaskTexture) so a cleared-then-reused key can't collide with a version
+ * the GL cache still holds.
+ * @type {Map<string, number>}
+ */
+const maskTextureVersions = new Map()
+
 export const setMaskTexture = (key, data) => {
     if (typeof key !== 'string' || !key) return
-    if (data) maskTextureCache.set(key, data)
+    if (data) {
+        maskTextureCache.set(key, data)
+        maskTextureVersions.set(key, (maskTextureVersions.get(key) || 0) + 1)
+    }
+}
+
+/**
+ * Current content version for a mask-texture key. 0 when the key has never
+ * been written. The renderer compares this against the version its cached GL
+ * texture was uploaded from; a mismatch forces a re-upload.
+ *
+ * @param {string} key
+ * @returns {number}
+ */
+export const getMaskTextureVersion = (key) => {
+    if (typeof key !== 'string' || !key) return 0
+    return maskTextureVersions.get(key) || 0
 }
 
 /**

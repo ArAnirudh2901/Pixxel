@@ -80,4 +80,4 @@ export { KIND_SCHEMAS, KIND_BUILDERS, getKindBuilder, getKindSchema } from './gl
 // the dev test panel ("Perf" badge) so engineers can see compile
 // time, cache hit rate, draw count, and identity-short-circuit
 // count without opening devtools.
-export { getRenderMetrics, resetRenderMetrics } from './megashader-renderer'
+export { getRenderMetrics, resetRenderMetrics, renderMegashader } from './megashader-renderer'
