@@ -270,7 +270,10 @@ const MaskControls = ({ dominantColor }) => {
         const mega = img.filters.find((f) => f && f.type === 'Megashader')
         const persisted = mega?.stack?.chain
         if (Array.isArray(persisted) && persisted.length > 0 && stack.chain.length === 0) {
-            setChain(persisted)
+            // 'hydrate' tells canvas.jsx this emission mirrors the filter
+            // already on the image — no re-apply, and crucially no project
+            // save of state that was just loaded.
+            setChain(persisted, { origin: 'hydrate' })
             chainHydratedRef.current = true
         }
     }, [tool.mainImage, stack.chain.length, setChain])
@@ -379,16 +382,24 @@ const MaskControls = ({ dominantColor }) => {
 
     // Image dimensions of the source image (not the displayed scaled size).
     // Used to default new linear/radial layers to a full-image line/ellipse.
-    // MUST come from the underlying HTMLImageElement's naturalWidth/Height —
-    // falling back to fabric's `width/height` would be the *scaled* size,
-    // which would put the layer's p1/p2 in scaled pixels while the GLSL's
-    // uImageSize (uploaded from sourceCanvas.width/height) is in natural
-    // pixels. The mismatch would be invisible until the user drags.
+    // MUST be the natural (source-pixel) size — fabric's object `width/height`
+    // would be the *scaled* size, which would put the layer's p1/p2 in scaled
+    // pixels while the GLSL's uImageSize is in natural pixels.
+    //
+    // Read `_originalElement` FIRST: once any filter runs (megashader, curves,
+    // …), fabric swaps `_element` to the filtered output <canvas>, which has
+    // no `naturalWidth` — reading only `_element` made imageSize null the
+    // moment a mask layer rendered, so the SECOND "Add Linear/Radial" bailed
+    // with "Image not ready yet". `_originalElement` stays the untouched
+    // source; the filtered canvas's width/height (natural-resolution) is the
+    // fallback.
     const imageSize = (() => {
         if (!tool.mainImage) return null
-        const sourceEl = tool.mainImage._element || tool.mainImage.getElement?.()
-        const w = sourceEl?.naturalWidth || 0
-        const h = sourceEl?.naturalHeight || 0
+        const src = tool.mainImage._originalElement
+            || tool.mainImage._element
+            || tool.mainImage.getElement?.()
+        const w = src?.naturalWidth || src?.width || 0
+        const h = src?.naturalHeight || src?.height || 0
         return w > 0 && h > 0 ? { width: w, height: h } : null
     })()
 
@@ -411,7 +422,11 @@ const MaskControls = ({ dominantColor }) => {
     // uImageSize` matches what the user pointed at).
     const pointerToImage = useCallback((fabricCanvas, e) => {
         if (!tool.mainImage || !fabricCanvas) return null
-        const pointer = fabricCanvas.getPointer(e.e || e)
+        // Fabric v7 removed `getPointer` — `getScenePoint` is the scene-space
+        // (object-coordinate) replacement. The old call threw a TypeError
+        // inside fabric's mouse:down dispatch, which silently killed every
+        // spatial draft drag (linear/radial could never be placed/committed).
+        const pointer = fabricCanvas.getScenePoint(e.e || e)
         const fabricObj = tool.mainImage
         const objLeft = fabricObj.left || 0
         const objTop = fabricObj.top || 0
@@ -2740,8 +2755,9 @@ const MaskControls = ({ dominantColor }) => {
         const fabricCanvas = canvasEditor
         if (!fabricCanvas) return
 
-        // Get the pixel color at click position from the canvas
-        const pointer = fabricCanvas.getPointer(e.e || e)
+        // Get the pixel color at click position from the canvas.
+        // (getScenePoint = fabric v7's replacement for the removed getPointer.)
+        const pointer = fabricCanvas.getScenePoint(e.e || e)
         const fabricObj = tool.mainImage
         const sourceEl = fabricObj?._element || fabricObj?.getElement?.()
         if (!sourceEl) return
@@ -2955,6 +2971,13 @@ const MaskControls = ({ dominantColor }) => {
                         </div>
                     )}
                     <AnimatePresence>
+                        {/* MaskChainCard is React.memo-wrapped: it still
+                            re-renders on every chain edit because `entry` and
+                            the inline callbacks below get fresh identities
+                            each render. Don't useCallback-"stabilise" these
+                            props without re-auditing the memo — if the props
+                            freeze while a layer mutates, the grade controls
+                            go visually dead. */}
                         {stack.chain.map((entry, i) => (
                             <MaskChainCard
                                 key={entry.layer.id}

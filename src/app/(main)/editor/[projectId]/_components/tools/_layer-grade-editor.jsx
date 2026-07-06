@@ -347,7 +347,7 @@ function ColorWheel({ label, value, onChange }) {
 }
 
 /* ── the editor ────────────────────────────────────────────────────────────── */
-export function LayerGradeEditor({ layer, onUpdate, onApplyCurve, histogram, dominantColor = '#53d8ff' }) {
+export const LayerGradeEditor = React.memo(function LayerGradeEditor({ layer, onUpdate, onApplyCurve, histogram, dominantColor = '#53d8ff' }) {
     const [activeChannel, setActiveChannel] = useState('rgb')
     const channel = CURVE_CHANNELS.find((c) => c.id === activeChannel) || CURVE_CHANNELS[0]
 
@@ -461,6 +461,6 @@ export function LayerGradeEditor({ layer, onUpdate, onApplyCurve, histogram, dom
             </div>
         </div>
     )
-}
+})
 
 export default LayerGradeEditor

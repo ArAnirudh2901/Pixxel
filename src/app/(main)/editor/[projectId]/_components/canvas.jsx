@@ -142,6 +142,13 @@ const fitImageInsideProject = (image, projectSize) => {
 
 const CanvasEditor = ({ project }) => {
     const [isLoading, setIsLoading] = useState(true)
+    // True only once the initial project state is FULLY on the canvas
+    // (loadFromJSON + image hydration + filter re-apply). Every save path
+    // checks it: persisting earlier would serialize a half-loaded canvas
+    // and overwrite the good state in Neon — closing the tab or navigating
+    // away while a project was still opening silently DESTROYED its masks
+    // and edits (the "sometimes my work disappears" class of loss).
+    const initialLoadCompleteRef = useRef(false)
     const canvasRef = useRef()
     const containerRef = useRef()
     const canvasInstanceRef = useRef(null)
@@ -595,6 +602,10 @@ const CanvasEditor = ({ project }) => {
         const canvas = canvasInstanceRef.current
         const proj = projectRef.current
         if (!canvas || !proj) return
+        // Never persist a canvas that hasn't finished its initial load —
+        // serializing mid-load captures a partial scene (image without its
+        // filters, or an empty canvas) and clobbers the real project state.
+        if (!initialLoadCompleteRef.current) return
 
         const canvasJSON = serializeCanvasState(canvas)
         const currentImageUrl = getPrimaryRemoteImageUrl(canvas)
@@ -801,6 +812,9 @@ const CanvasEditor = ({ project }) => {
         let mounted = true
 
         disposeCanvasInstance()
+        // Re-arm the save gate: nothing may persist until THIS init finishes
+        // putting the full project state on the canvas.
+        initialLoadCompleteRef.current = false
         historyRef.current = []
         historyIndexRef.current = -1
 
@@ -978,6 +992,8 @@ const CanvasEditor = ({ project }) => {
             canvas.renderOnAddRemove = true
             canvas.calcOffset()
             canvas.requestRenderAll()
+            // Full project state is on the canvas — saves are safe from here.
+            initialLoadCompleteRef.current = true
             setCanvasEditor(canvas)
 
             const isExpansionMode = () =>
@@ -1285,6 +1301,18 @@ const CanvasEditor = ({ project }) => {
     // (50-200 ms for a complex chain) re-runs for every step, blocking
     // the main thread. The 150 ms debounce coalesces a rapid burst
     // into one recompile after the user pauses.
+    //
+    // Live-grade fast path — the 150 ms debounce only guards STRUCTURAL
+    // stack changes (layer added/removed/reordered/op changed), because
+    // only those force a GLSL recompile. Grade values (gamma, wheels,
+    // curve LUT, adjust sliders) are uniforms/textures: the compiled
+    // program is an LRU-cache hit (see compiledCache in
+    // megashader-compiler.js) and GL textures re-upload only when their
+    // version bumps, so uniform-only events re-apply immediately on a
+    // trailing requestAnimationFrame (`maskApplyRafRef`) — same pattern
+    // as `handleGlobalAlpha` below. Without this split, the debounce
+    // timer reset on every pointermove and the canvas never repainted
+    // DURING a drag, which read as "the grade controls do nothing".
     const megashaderAlphaRef = useRef(1)
     // "Show mask" overlay + global invert — chain-wide render options driven
     // by the Mask tool via window events; mirror globalAlpha's ref pattern.
@@ -1292,6 +1320,17 @@ const CanvasEditor = ({ project }) => {
     const megashaderInvertRef = useRef(false)
     const getLastAppliedStackRef = useRef(/** @type {import('@/lib/megashader/mask-types').MaskStack} */ ({ chain: [] }))
     const recompileTimerRef = useRef(/** @type {ReturnType<typeof setTimeout> | null} */ (null))
+    const maskApplyRafRef = useRef(/** @type {number | null} */ (null))
+    const lastStructuralSigRef = useRef(/** @type {string | null} */ (null))
+    // Draft-preview session for grade drags (see startPreviewSession in the
+    // effect below): GPU-only capped-resolution render into a DOM overlay
+    // while the pointer is down; one exact full-resolution commit on idle.
+    const previewSessionRef = useRef(/** @type {any} */ (null))
+    const previewCommitTimerRef = useRef(/** @type {ReturnType<typeof setTimeout> | null} */ (null))
+    // Mask-edit persistence (see scheduleMaskSave in the effect below):
+    // component-level so an effect re-subscribe can't drop a pending save.
+    const maskSaveTimerRef = useRef(/** @type {ReturnType<typeof setTimeout> | null} */ (null))
+    const maskSaveOldestPendingRef = useRef(/** @type {number | null} */ (null))
     useEffect(() => {
         if (typeof window === 'undefined') return undefined
 
@@ -1319,36 +1358,273 @@ const CanvasEditor = ({ project }) => {
                     maskOverlay: megashaderOverlayRef.current,
                 })
                 canvasInstanceRef.current?.requestRenderAll?.()
-            }).catch(() => { /* noop — module not available in non-test paths */ })
+            }).catch((err) => {
+                // Surface failures — a swallowed shader/apply error here used
+                // to make the whole mask pipeline silently inert, which is
+                // undiagnosable from the UI.
+                console.warn('[megashader] live apply failed:', err)
+            })
         }
 
-        // Step 10.2: debounced entry point. Cancels any pending
-        // recompile and schedules a new one 150 ms out. The 150 ms
-        // window is short enough to feel instant on slider release
-        // but long enough to coalesce a fast slider drag into a
-        // single recompile.
+        // ── Draft-preview session ─────────────────────────────────────
+        // The exact pipeline (doApply → applyFilters → megashader render →
+        // readPixels → getImageData) moves ~5 full-resolution buffers per
+        // tick — linear in megapixels, so grade drags on large photos drop
+        // to a slideshow. During a drag we instead render the megashader
+        // from a capped-resolution snapshot into a DOM <canvas> overlaid
+        // exactly on the image (GPU work + one small readback per frame,
+        // independent of source size), and run the exact full-res pipeline
+        // ONCE when the drag goes idle. Lightroom-style draft preview.
+        const MAX_PREVIEW_DIM = 1280
+        const PREVIEW_COMMIT_IDLE_MS = 160
+
+        const startPreviewSession = () => {
+            const canvas = canvasInstanceRef.current
+            const image = findPrimaryImage()
+            if (!canvas || !image || !canvas.wrapperEl) return null
+            // An axis-aligned overlay can't represent a rotated image —
+            // fall back to the exact per-tick pipeline (correct, slower).
+            if (Math.abs((image.angle || 0) % 360) > 0.01) return null
+
+            // Clean source = all prior filters, WITHOUT the megashader.
+            // When the megashader is the only filter this is simply the
+            // original element (free); otherwise re-run the chain once with
+            // the megashader disabled — a single full-res cost at drag
+            // START, not per tick.
+            let cleanSource = image._originalElement
+            const hasOtherFilters = Array.isArray(image.filters)
+                && image.filters.some((f) => f && f.type !== 'Megashader')
+            if (hasOtherFilters) {
+                const mega = image.filters.find((f) => f && f.type === 'Megashader')
+                if (mega) {
+                    mega.enabled = false
+                    try { image.applyFilters() } catch { /* keep going */ }
+                    mega.enabled = true
+                }
+                cleanSource = image._element || cleanSource
+            }
+            const srcW = cleanSource?.naturalWidth || cleanSource?.width || 0
+            const srcH = cleanSource?.naturalHeight || cleanSource?.height || 0
+            if (!srcW || !srcH) return null
+
+            const scale = Math.min(1, MAX_PREVIEW_DIM / Math.max(srcW, srcH))
+            const srcCanvas = document.createElement('canvas')
+            srcCanvas.width = Math.max(1, Math.round(srcW * scale))
+            srcCanvas.height = Math.max(1, Math.round(srcH * scale))
+            const sctx = srcCanvas.getContext('2d')
+            if (!sctx) return null
+            sctx.imageSmoothingEnabled = true
+            sctx.imageSmoothingQuality = 'high'
+            sctx.drawImage(cleanSource, 0, 0, srcCanvas.width, srcCanvas.height)
+
+            const overlayEl = document.createElement('canvas')
+            overlayEl.className = 'phosmith-megashader-preview'
+            overlayEl.style.position = 'absolute'
+            overlayEl.style.pointerEvents = 'none'
+            // Under the interaction canvas (selection borders, brush cursor
+            // stay visible), over the lower canvas that shows the image.
+            canvas.wrapperEl.insertBefore(overlayEl, canvas.upperCanvasEl || null)
+            const session = {
+                overlayEl,
+                ctx: overlayEl.getContext('2d'),
+                srcCanvas,
+                image,
+            }
+            previewSessionRef.current = session
+            return session
+        }
+
+        const removePreviewOverlay = (session) => {
+            try { session.overlayEl.remove() } catch { /* already gone */ }
+        }
+
+        const endPreviewSession = (commit) => {
+            const session = previewSessionRef.current
+            if (!session) return
+            previewSessionRef.current = null
+            if (previewCommitTimerRef.current !== null) {
+                clearTimeout(previewCommitTimerRef.current)
+                previewCommitTimerRef.current = null
+            }
+            if (!commit) {
+                removePreviewOverlay(session)
+                return
+            }
+            // Exact full-res commit; drop the overlay only after fabric has
+            // painted the committed pixels so the swap is seamless.
+            doApply(getLastAppliedStackRef.current)
+            const canvas = canvasInstanceRef.current
+            let removed = false
+            const removeOnce = () => {
+                if (removed) return
+                removed = true
+                removePreviewOverlay(session)
+            }
+            if (canvas?.once) canvas.once('after:render', removeOnce)
+            // Safety net — never leave a stale overlay glued to the DOM.
+            setTimeout(removeOnce, 600)
+        }
+
+        const renderPreviewFrame = (stack) => {
+            const session = previewSessionRef.current
+            const canvas = canvasInstanceRef.current
+            if (!session || !canvas) return
+            const { image, overlayEl, ctx, srcCanvas } = session
+            if (!ctx || !canvas.getObjects?.().includes(image)) {
+                endPreviewSession(false)
+                return
+            }
+            import('@/lib/megashader').then((mod) => {
+                // Guard: session may have committed while the module loaded.
+                if (previewSessionRef.current !== session) return
+                try {
+                    // Position the overlay on the image's on-screen quad.
+                    // oCoords are fabric's own viewport-space (CSS px)
+                    // corners — exact under any pan/zoom, refreshed here so
+                    // a mid-drag zoom can't leave the overlay stranded.
+                    image.setCoords()
+                    const { tl, tr, bl } = image.oCoords || {}
+                    if (!tl || !tr || !bl) { endPreviewSession(false); return }
+                    const cssW = Math.max(1, tr.x - tl.x)
+                    const cssH = Math.max(1, bl.y - tl.y)
+                    overlayEl.style.left = `${tl.x}px`
+                    overlayEl.style.top = `${tl.y}px`
+                    overlayEl.style.width = `${cssW}px`
+                    overlayEl.style.height = `${cssH}px`
+                    // Backing store: preview-res is enough while dragging —
+                    // scale to the smaller of screen size and preview size.
+                    const dpr = window.devicePixelRatio || 1
+                    const bw = Math.max(1, Math.min(Math.round(cssW * dpr), srcCanvas.width))
+                    const bh = Math.max(1, Math.min(Math.round(cssH * dpr), srcCanvas.height))
+                    if (overlayEl.width !== bw) overlayEl.width = bw
+                    if (overlayEl.height !== bh) overlayEl.height = bh
+
+                    const result = mod.renderMegashader(srcCanvas, stack, {
+                        globalMaskAlpha: megashaderAlphaRef.current,
+                        globalInvert: megashaderInvertRef.current,
+                        maskOverlay: megashaderOverlayRef.current,
+                    })
+                    if (!result) return
+                    ctx.imageSmoothingEnabled = true
+                    ctx.clearRect(0, 0, overlayEl.width, overlayEl.height)
+                    ctx.drawImage(result, 0, 0, overlayEl.width, overlayEl.height)
+                } catch (err) {
+                    console.warn('[megashader] preview frame failed, committing full-res:', err)
+                    endPreviewSession(true)
+                }
+            }).catch((err) => {
+                console.warn('[megashader] preview module load failed:', err)
+                endPreviewSession(false)
+            })
+        }
+
+        const schedulePreviewCommit = () => {
+            if (previewCommitTimerRef.current !== null) {
+                clearTimeout(previewCommitTimerRef.current)
+            }
+            previewCommitTimerRef.current = setTimeout(() => {
+                previewCommitTimerRef.current = null
+                endPreviewSession(true)
+            }, PREVIEW_COMMIT_IDLE_MS)
+        }
+
+        // Step 10.2: debounced entry point for STRUCTURAL changes only
+        // (see `wrapped` below). Cancels any pending recompile and
+        // schedules a new one 150 ms out — short enough to feel instant,
+        // long enough to coalesce a burst of structural edits into a
+        // single recompile. It also deliberately absorbs the Mask-tool
+        // remount race: the hook's initial `{ chain: [] }` emission would
+        // otherwise strip the persisted filter off the image before
+        // mask.jsx's hydration effect re-reads it.
         const RECOMPILE_DEBOUNCE_MS = 150
-        const handleLayersChanged = (event) => {
-            const stack = event?.detail?.stack
+        const handleLayersChanged = () => {
+            // A structural change mid-drag invalidates the preview's
+            // compiled assumptions — drop the overlay; the debounced
+            // full-res apply below repaints the truth.
+            endPreviewSession(false)
             if (recompileTimerRef.current !== null) {
                 clearTimeout(recompileTimerRef.current)
             }
             recompileTimerRef.current = setTimeout(() => {
                 recompileTimerRef.current = null
-                doApply(stack)
+                // Apply the LATEST stack, not the triggering event's —
+                // uniform-only drags may have landed via the fast path
+                // while this debounce was pending, and re-applying an
+                // older snapshot would revert them.
+                doApply(getLastAppliedStackRef.current)
             }, RECOMPILE_DEBOUNCE_MS)
+        }
+
+        // Structural signature — mirrors `computeCacheKey()` in
+        // src/lib/megashader/megashader-compiler.js (length|kinds|ops).
+        // Grade values (gamma/wheels/curves/adjust sliders) are uniforms
+        // and never change it. Deliberately NOT imported from
+        // '@/lib/megashader': that module stays lazy-loaded (see doApply)
+        // so the editor bundle never pulls in the GLSL compiler. Keep in
+        // sync with computeCacheKey if mask kinds/ops semantics change.
+        const structuralSignature = (stack) => {
+            const chain = Array.isArray(stack?.chain) ? stack.chain : []
+            return `${chain.length}|${chain.map((e) => e?.layer?.kind).join(',')}|${chain.map((e) => e?.op).join(',')}`
+        }
+
+        // Uniform-only fast path: one trailing rAF per frame; it reads the
+        // latest stack at fire time, so the drag's release value always
+        // lands and a pending frame can never apply a stale snapshot.
+        // Inside the rAF, prefer the draft-preview session (GPU-only,
+        // resolution-capped, instantaneous at any source size); fall back
+        // to the exact per-tick pipeline when a session can't be built
+        // (no image, rotated image, missing wrapper).
+        const scheduleImmediateApply = () => {
+            if (maskApplyRafRef.current !== null) return
+            maskApplyRafRef.current = requestAnimationFrame(() => {
+                maskApplyRafRef.current = null
+                const stack = getLastAppliedStackRef.current
+                const session = previewSessionRef.current || startPreviewSession()
+                if (session) {
+                    renderPreviewFrame(stack)
+                    schedulePreviewCommit()
+                } else {
+                    doApply(stack)
+                }
+            })
+        }
+
+        // Persist mask/grade edits. The megashader path never fires Fabric
+        // `object:*` events, so the canvas autosave (`makeChangeHandler`
+        // below) is blind to it — pre-fix, masks lived only in RAM and
+        // vanished on tab close. Trailing debounce coalesces a drag storm
+        // into one save (serialize + texture encode is too expensive at
+        // drag frequency); the max-wait deadline guarantees a long fiddle
+        // session still persists every 20 s.
+        const MASK_SAVE_MAX_WAIT_MS = 20_000
+        const scheduleMaskSave = () => {
+            const now = Date.now()
+            if (maskSaveOldestPendingRef.current === null) {
+                maskSaveOldestPendingRef.current = now
+            }
+            if (maskSaveTimerRef.current !== null) {
+                clearTimeout(maskSaveTimerRef.current)
+            }
+            const deadline = maskSaveOldestPendingRef.current + MASK_SAVE_MAX_WAIT_MS
+            const delay = Math.min(MAJOR_SAVE_DEBOUNCE_MS, Math.max(0, deadline - now))
+            maskSaveTimerRef.current = setTimeout(() => {
+                maskSaveTimerRef.current = null
+                maskSaveOldestPendingRef.current = null
+                saveCanvasState()
+            }, delay)
         }
 
         const handleGlobalAlpha = (event) => {
             const value = event?.detail?.value
             if (typeof value !== 'number') return
             megashaderAlphaRef.current = Math.max(0, Math.min(1, value))
-            // Alpha is a uniform, not a shader-struct change — skip
-            // the debounce so the slider feels live. The shader
-            // recompile is gated on the LRU cache, so if the program
-            // was already compiled for this exact stack, the second
-            // call is just a `applyFilters` re-run.
-            doApply(getLastAppliedStackRef.current)
+            // Alpha is a uniform, not a shader-struct change — take the
+            // same rAF fast path as grade drags (draft-preview when
+            // available) so the fader stays live on any image size.
+            scheduleImmediateApply()
+            // globalMaskAlpha is persisted by MegashaderFilter.toObject —
+            // same Fabric-event blind spot as the chain, same fix.
+            scheduleMaskSave()
         }
 
         // "Show mask" overlay + global invert — chain-wide render options.
@@ -1356,16 +1632,41 @@ const CanvasEditor = ({ project }) => {
         // against the last-applied stack.
         const handleOverlay = (event) => {
             megashaderOverlayRef.current = Boolean(event?.detail?.value)
-            doApply(getLastAppliedStackRef.current)
+            scheduleImmediateApply()
         }
         const handleInvert = (event) => {
             megashaderInvertRef.current = Boolean(event?.detail?.value)
-            doApply(getLastAppliedStackRef.current)
+            scheduleImmediateApply()
+            // globalInvert is persisted by toObject (the overlay is not —
+            // it's a view-only render option, so handleOverlay doesn't save).
+            scheduleMaskSave()
         }
 
         const wrapped = (event) => {
-            getLastAppliedStackRef.current = event?.detail?.stack || { chain: [] }
-            handleLayersChanged(event)
+            const origin = event?.detail?.origin
+            // 'init' is the hook's untouched initial `{ chain: [] }` emission
+            // on (re)mount. It carries no information — and applying it would
+            // strip a persisted filter off the image before mask.jsx's
+            // hydration effect reads it — so it neither applies nor saves,
+            // and doesn't clobber `getLastAppliedStackRef` (which may hold
+            // the real stack from a previous Mask-tool session).
+            if (origin === 'init') return
+            const stack = event?.detail?.stack || { chain: [] }
+            getLastAppliedStackRef.current = stack
+            const sig = structuralSignature(stack)
+            const structural = sig !== lastStructuralSigRef.current
+            lastStructuralSigRef.current = sig
+            // 'hydrate' mirrors the filter already installed on the image
+            // (panel re-seed after load): record it as the baseline for
+            // future fast-path decisions, but don't re-apply what's already
+            // rendered and — crucially — don't re-save just-loaded state.
+            if (origin === 'hydrate') return
+            if (structural) {
+                handleLayersChanged()
+            } else {
+                scheduleImmediateApply()
+            }
+            scheduleMaskSave()
         }
 
         window.addEventListener('phosmith:mask-layers-changed', wrapped)
@@ -1385,8 +1686,27 @@ const CanvasEditor = ({ project }) => {
                 clearTimeout(recompileTimerRef.current)
                 recompileTimerRef.current = null
             }
+            // Same for a pending uniform-only fast-path frame.
+            if (maskApplyRafRef.current !== null) {
+                cancelAnimationFrame(maskApplyRafRef.current)
+                maskApplyRafRef.current = null
+            }
+            // Commit any in-flight draft preview — dropping it would leave
+            // the on-image filter holding the pre-drag stack while the
+            // panel (and the pending mask save) already reflect the new
+            // values.
+            endPreviewSession(true)
+            // FLUSH (don't drop) a pending mask save — a re-subscribe or
+            // unmount mid-debounce would otherwise re-open the "masks never
+            // persist" hole for the last burst of edits.
+            if (maskSaveTimerRef.current !== null) {
+                clearTimeout(maskSaveTimerRef.current)
+                maskSaveTimerRef.current = null
+                maskSaveOldestPendingRef.current = null
+                saveCanvasState()
+            }
         }
-    }, [canvasEditor])
+    }, [canvasEditor, saveCanvasState])
 
     // Register the UI-decoupled mask command surface so the in-app agent can
     // drive masking headlessly (NOT wired to any agent yet — see

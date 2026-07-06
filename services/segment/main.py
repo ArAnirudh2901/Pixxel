@@ -874,7 +874,7 @@ def _bbox_of(mask: np.ndarray) -> "list[int]":
 
 def _mask_png_b64(alpha: np.ndarray) -> str:
     buf = io.BytesIO()
-    Image.fromarray(alpha, "L").save(buf, format="PNG", optimize=True)
+    Image.fromarray(alpha, "L").save(buf, format="PNG", compress_level=1)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -1406,12 +1406,12 @@ async def _read_limited(image: UploadFile) -> bytes:
     """Stream-read an UploadFile into memory, aborting if it exceeds the
     upload limit (defends against chunked uploads that bypass the
     Content-Length middleware above). Reads the underlying SpooledTemporaryFile
-    in 64 KB chunks via the threadpool so we never block the event loop
+    in 1 MB chunks via the threadpool so we never block the event loop
     and never buffer the whole body before checking size.
     """
     contents = bytearray()
     while True:
-        chunk = await run_in_threadpool(image.file.read, 64 * 1024)
+        chunk = await run_in_threadpool(image.file.read, 1024 * 1024)
         if not chunk:
             break
         contents.extend(chunk)
@@ -1478,7 +1478,7 @@ def _rasterize_shape_mask(width: int, height: int, points: list[tuple[float, flo
         engine = "pillow-polygon"
 
     buf = io.BytesIO()
-    out.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", compress_level=1)
     return buf.getvalue(), engine
 
 
@@ -1768,7 +1768,7 @@ async def segment(image: UploadFile = File(..., alias="image")) -> Response:
     out = Image.fromarray(rgba, "RGBA")
 
     buf = io.BytesIO()
-    out.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", compress_level=1)
     elapsed = time.perf_counter() - t0
     log.info(
         "segmented %s (%dx%d, %dKB) mode=%s subjects=%d in %.2fs -> %dKB",
@@ -2088,7 +2088,7 @@ async def sam2_click(
 
     mask_img = Image.fromarray(best_mask, mode="L")
     buf = io.BytesIO()
-    mask_img.save(buf, format="PNG", optimize=True)
+    mask_img.save(buf, format="PNG", compress_level=1)
 
     resp_headers = {
             "Cache-Control": "no-store",
@@ -2190,7 +2190,7 @@ async def depth(image: UploadFile = File(..., alias="image")) -> Response:
 
     depth_img = Image.fromarray(depth_arr, mode="L")
     buf = io.BytesIO()
-    depth_img.save(buf, format="PNG", optimize=True)
+    depth_img.save(buf, format="PNG", compress_level=1)
 
     resp_headers = {
             "Cache-Control": "no-store",

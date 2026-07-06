@@ -63,6 +63,9 @@ skills-lock.json
 
 .cache/
 
+# Consolidated local model cache (HF hub + rembg u2net + torch/LaMa weights)
+model_cache/
+
 # Videos
 *.mp4
 *.mov
@@ -72,3 +75,10 @@ skills-lock.json
 *.flv
 *.wmv
 *.m4v
+
+# dev-browser (real-Chrome CDP automation — scripts/dev-browser/)
+.chrome-dev-profile/
+scripts/dev-browser/screenshots/
+
+# Claude Code local permission settings (per-machine)
+.claude/settings.local.json

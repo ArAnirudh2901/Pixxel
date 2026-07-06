@@ -31,6 +31,7 @@
 import { filters, classRegistry } from 'fabric'
 import { renderMegashader, disposeRenderer } from './megashader-renderer'
 import { getMaskTexture, setMaskTexture } from './mask-types'
+import { buildPackedLutFromCurves } from '../curve-lut'
 
 const MEGASHADER_FILTER_TYPE = 'Megashader'
 
@@ -39,31 +40,54 @@ const MEGASHADER_FILTER_TYPE = 'Megashader'
 // lasso) so a persisted chain survives save → reload.
 const TEXTURE_KEY_FIELDS = ['maskTextureKey', 'brushTextureKey', 'depthMapKey']
 
+// Longest-side cap for PERSISTED mask textures. Masks are soft alpha maps
+// sampled at normalized UV with LINEAR filtering (see megashader-renderer /
+// glsl-mask-kinds), so a downscaled texture restores resolution-independently
+// — it just upsamples bilinearly at render time. Capping keeps a multi-layer
+// chain's PNG data URLs well under the Neon canvasState budget
+// (MAX_NEON_STATE_CHARS in canvas.jsx, whose oversize trim only sheds
+// history). In-session rendering keeps the full-resolution texture — this cap
+// applies at serialize time only.
+const MAX_PERSIST_TEXTURE_DIM = 1024
+
 /**
  * Convert a cached texture (ImageData | HTMLCanvasElement | HTMLImageElement |
- * ImageBitmap) to a PNG data URL for persistence. Returns null if it can't be
+ * ImageBitmap) to a PNG data URL for persistence, downscaled so its longest
+ * side is at most MAX_PERSIST_TEXTURE_DIM. Returns null if it can't be
  * rasterised (non-browser, tainted canvas, zero-size).
  */
 const textureToDataUrl = (data) => {
     try {
         if (!data || typeof document === 'undefined') return null
-        let canvas
-        if (typeof HTMLCanvasElement !== 'undefined' && data instanceof HTMLCanvasElement) {
-            canvas = data
-        } else if (typeof ImageData !== 'undefined' && data instanceof ImageData) {
-            canvas = document.createElement('canvas')
-            canvas.width = data.width
-            canvas.height = data.height
-            canvas.getContext('2d')?.putImageData(data, 0, 0)
-        } else {
-            const w = data.width || data.naturalWidth || 0
-            const h = data.height || data.naturalHeight || 0
-            if (!w || !h) return null
-            canvas = document.createElement('canvas')
-            canvas.width = w
-            canvas.height = h
-            canvas.getContext('2d')?.drawImage(data, 0, 0)
+        // ImageData isn't drawable — blit it onto a scratch canvas first so
+        // the single scale-draw below covers every source type.
+        let source = data
+        if (typeof ImageData !== 'undefined' && data instanceof ImageData) {
+            const scratch = document.createElement('canvas')
+            scratch.width = data.width
+            scratch.height = data.height
+            scratch.getContext('2d')?.putImageData(data, 0, 0)
+            source = scratch
         }
+        const w = source.width || source.naturalWidth || 0
+        const h = source.height || source.naturalHeight || 0
+        if (!w || !h) return null
+        const scale = Math.min(1, MAX_PERSIST_TEXTURE_DIM / Math.max(w, h))
+        if (
+            scale === 1 &&
+            typeof HTMLCanvasElement !== 'undefined' &&
+            source instanceof HTMLCanvasElement
+        ) {
+            return source.toDataURL('image/png')
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.round(w * scale))
+        canvas.height = Math.max(1, Math.round(h * scale))
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return null
+        ctx.imageSmoothingEnabled = true
+        ctx.imageSmoothingQuality = 'high'
+        ctx.drawImage(source, 0, 0, canvas.width, canvas.height)
         return canvas.toDataURL('image/png')
     } catch {
         return null
@@ -107,12 +131,19 @@ const restoreTexture = (key, dataUrl) => new Promise((resolve) => {
  */
 
 export class MegashaderFilter extends filters.BaseFilter {
+    // Fabric v7's BaseFilter exposes `type` as a GETTER-ONLY accessor that
+    // reads `this.constructor.type` — assigning `this.type = ...` in the
+    // constructor throws "Cannot set property type ... which has only a
+    // getter", which killed every construction of this filter (and, caught
+    // by a silent catch upstream, made the whole mask pipeline a no-op).
+    // The static field is the v7-correct way to name the class.
+    static type = MEGASHADER_FILTER_TYPE
+
     /**
      * @param {MegashaderFilterOptions} [options]
      */
     constructor(options = {}) {
         super()
-        this.type = MEGASHADER_FILTER_TYPE
         // No fragmentSource — the renderer compiles the real source via its
         // own private WebGL2 context. This filter implements applyTo2d() to
         // integrate with Fabric v7's Canvas2D filter pipeline.
@@ -212,10 +243,13 @@ export class MegashaderFilter extends filters.BaseFilter {
     }
 
     /**
-     * Fabric serialises filters via `toObject`/`toJSON`. Persist the
-     * minimum needed to rehydrate the filter on `loadFromJSON`. Texture
-     * handles (smartBrush, semantic, depth) are intentionally NOT persisted
-     * here — those need separate persistence paths (Step 7).
+     * Fabric serialises filters via `toObject`/`toJSON`. Persist the full
+     * stack (incl. per-layer grade params) plus every texture-backed
+     * layer's mask bitmap as a size-capped PNG data URL, so a persisted
+     * chain survives save → reload. Tone-curve LUTs are the one exception:
+     * they are rebuilt from `layer.curves` in `fromObject` instead (the
+     * packed LUT keeps the master curve in the ALPHA channel, and a canvas
+     * PNG round-trip premultiplies RGB by alpha, corrupting it).
      *
      * @returns {object}
      */
@@ -263,6 +297,28 @@ export class MegashaderFilter extends filters.BaseFilter {
             await Promise.all(
                 Object.entries(textures).map(([key, url]) => restoreTexture(key, url)),
             )
+        }
+        // Rebuild per-layer tone-curve LUTs from their control points
+        // (mirrors `applyCurve` in mask.jsx). Without this the persisted
+        // `curveLutKey` points at a missing cache entry after reload, the
+        // shader's `curveOn` stays 0, and the curve grade silently
+        // disappears. Rebuilding (not PNG-round-tripping) is deliberate —
+        // see the `toObject` docblock. Runs before the filter resolves so
+        // the first render samples a real LUT, even if the Mask panel is
+        // never opened.
+        const chain = Array.isArray(object?.stack?.chain) ? object.stack.chain : []
+        for (const entry of chain) {
+            const layer = entry && entry.layer
+            if (!layer || !layer.curveLutKey || !layer.curves) continue
+            try {
+                const { packed, identity } = buildPackedLutFromCurves(layer.curves)
+                if (!identity) {
+                    setMaskTexture(
+                        layer.curveLutKey,
+                        new ImageData(new Uint8ClampedArray(packed), 256, 1),
+                    )
+                }
+            } catch { /* curve stays identity for this layer — curveOn 0 */ }
         }
         const filter = new MegashaderFilter({
             stack: object?.stack,

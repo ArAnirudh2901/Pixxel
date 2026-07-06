@@ -96,10 +96,27 @@ export const useMaskLayers = () => {
     // events (150 ms) and the compiled program is LRU-cached, so firing on
     // every change is cheap; the signature is still used elsewhere for
     // coarse change detection.
+    //
+    // Each emission carries an `origin` tag so canvas.jsx can tell real
+    // edits (which must apply AND schedule a project save) from emissions
+    // that merely mirror existing state:
+    //   'init'    — the reducer's untouched initial stack (mount / StrictMode
+    //               effect replay). Detected by object identity, not a
+    //               first-run flag, so a dev-mode double-mount can't emit a
+    //               second untagged empty stack that would strip the
+    //               persisted filter off the image before hydration reads it.
+    //   'hydrate' — `setChain(..., { origin: 'hydrate' })` re-seeding the
+    //               panel from the filter already installed on the image.
+    //   null      — a real user/agent edit.
+    const initialStackRef = useRef(stack)
+    const emitOriginRef = useRef(/** @type {string | null} */ (null))
     useEffect(() => {
         lastSignatureRef.current = computeSignature(stack)
+        const origin = emitOriginRef.current
+            ?? (stack === initialStackRef.current ? 'init' : null)
+        emitOriginRef.current = null
         try {
-            window.dispatchEvent(new CustomEvent('phosmith:mask-layers-changed', { detail: { stack } }))
+            window.dispatchEvent(new CustomEvent('phosmith:mask-layers-changed', { detail: { stack, origin } }))
         } catch { /* SSR safe */ }
     }, [stack])
 
@@ -282,10 +299,14 @@ export const useMaskLayers = () => {
     // Hydrate the whole chain from persisted project state (textures must be
     // re-registered via setMaskTexture by the caller BEFORE calling this so
     // the renderer doesn't sample a missing texture). Resets history.
-    const setChain = useCallback((chain) => {
+    // Pass `{ origin: 'hydrate' }` when re-seeding from already-persisted
+    // state so canvas.jsx doesn't re-apply/re-save what it just loaded;
+    // omit it for real replacements (e.g. agent edits), which must save.
+    const setChain = useCallback((chain, { origin = null } = {}) => {
         const safe = Array.isArray(chain) ? chain : []
         pastRef.current = []
         futureRef.current = []
+        emitOriginRef.current = origin
         dispatch({ type: 'set', chain: safe })
     }, [])
 

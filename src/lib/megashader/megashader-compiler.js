@@ -36,6 +36,37 @@ export const MAX_LAYERS = 8
 const truncateChain = (chain) => (Array.isArray(chain) ? chain.slice(0, MAX_LAYERS) : [])
 
 /**
+ * Structural compile cache (Cluster A change 3). `compileMegashader` builds
+ * the full GLSL source on every call, but the result is a pure function of
+ * `cacheKey` (kinds|ops|length): layer PARAMETER values are uniforms, never
+ * baked into the source (see `buildLayerFunction` / `buildLayerAdjustFunction`,
+ * which read only `slotIndex`/`kind`). So a given `cacheKey` always yields a
+ * byte-identical `frag`/`vert`, and memoising the whole CompiledShader is
+ * lossless. This is the SAME key the renderer's WebGLProgram cache uses, so
+ * the two caches stay perfectly aligned. LRU-capped to bound memory.
+ * @type {Map<string, import('./mask-types').CompiledShader>}
+ */
+const compiledCache = new Map()
+const MAX_COMPILED_CACHE = 64
+
+/**
+ * Insert a compiled shader into `compiledCache` under `cacheKey`, evicting the
+ * oldest entry when the cap is reached, and return it (so callers can
+ * `return rememberCompiled(key, {...})`).
+ * @param {string} cacheKey
+ * @param {import('./mask-types').CompiledShader} compiled
+ * @returns {import('./mask-types').CompiledShader}
+ */
+const rememberCompiled = (cacheKey, compiled) => {
+    if (compiledCache.size >= MAX_COMPILED_CACHE) {
+        const oldest = compiledCache.keys().next().value
+        if (oldest !== undefined) compiledCache.delete(oldest)
+    }
+    compiledCache.set(cacheKey, compiled)
+    return compiled
+}
+
+/**
  * Normalise a MaskStack. Throws on shape errors (unknown kind, missing
  * fields, wrong types) so a malformed stack never reaches the GPU.
  *
@@ -101,9 +132,14 @@ export const computeCacheKey = (stack) => {
  */
 export const compileMegashader = (rawStack) => {
     const stack = normaliseStack(rawStack)
+    // Structural compile cache (Cluster A change 3): the CompiledShader is a
+    // pure function of `cacheKey`, so return a memoised result before doing
+    // any GLSL string building on a cache hit.
+    const cacheKey = computeCacheKey(stack)
+    const memoised = compiledCache.get(cacheKey)
+    if (memoised) return memoised
     const vert = buildVertexShader()
     const fragmentTemplate = buildFragmentTemplate()
-    const cacheKey = computeCacheKey(stack)
 
     if (stack.chain.length === 0) {
         // Passthrough — no mask functions, no adjust functions, no chain.
@@ -111,7 +147,7 @@ export const compileMegashader = (rawStack) => {
         // `srcRgb` and `runningAlpha` to 0, so the final mix is identity.
         // The dispatcher is also emitted (returns 0 unconditionally) so
         // the fragment compiles cleanly even though it's never reached.
-        return {
+        return rememberCompiled(cacheKey, {
             frag: fragmentTemplate
                 .replace('{{MASK_FUNCTIONS}}', '// passthrough — no layers')
                 .replace('{{ADJUST_FUNCTIONS}}', '// passthrough — no adjustments')
@@ -120,7 +156,7 @@ export const compileMegashader = (rawStack) => {
             vert,
             cacheKey,
             passthrough: true,
-        }
+        })
     }
 
     const layerFns = stack.chain
@@ -145,5 +181,5 @@ export const compileMegashader = (rawStack) => {
         .replace('{{EVAL_DISPATCHER}}', evalDispatcher)
         .replace('{{BOOLEAN_CHAIN}}', booleanChain)
 
-    return { frag, vert, cacheKey, passthrough: false }
+    return rememberCompiled(cacheKey, { frag, vert, cacheKey, passthrough: false })
 }
