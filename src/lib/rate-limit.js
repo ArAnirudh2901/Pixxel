@@ -20,7 +20,7 @@ const LIMITERS = {
     "edit-judge":        { count: 20,  windowSec: 60 },  // 20 / minute — vision judge (2 images per call)
     "ai-extend":         { count: 5,   windowSec: 60 },  // 5  / minute — expensive AI
     "ai-segment":        { count: 5,   windowSec: 60 },  // 5  / minute — HuggingFace segmentation
-    "ai-sam2":           { count: 15,  windowSec: 60 },  // 15 / minute — interactive click/box prompts (the AI Object Eraser fires one per click, so this must absorb a multi-subject click burst)
+    "ai-sam3":           { count: 15,  windowSec: 60 },  // 15 / minute — interactive click/box prompts (the AI Object Eraser fires one per click, so this must absorb a multi-subject click burst)
     "ai-inpaint":        { count: 5,   windowSec: 60 },  // 5  / minute — GPU-heavy inpaint (LaMa / HF SD)
     "ai-auto-crop":      { count: 10,  windowSec: 60 },  // 10 / minute — local subject + depth + saliency pipeline
     "ai-ground":         { count: 10,  windowSec: 60 },  // 10 / minute — CLIPSeg + SAM2 text grounding

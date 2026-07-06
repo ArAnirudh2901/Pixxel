@@ -16,6 +16,8 @@ export const MAX_GROW_PX = 200
 
 /** Single-pass separable box blur (radius r) on a single channel. O(n). */
 export const boxBlur = (src, w, h, r) => {
+    // Non-integer r breaks the running-sum indexing; NaN passes `r < 1`.
+    r = Number.isFinite(r) ? Math.floor(r) : 0
     if (r < 1) return Float32Array.from(src)
     const tmp = new Float32Array(w * h)
     const out = new Float32Array(w * h)

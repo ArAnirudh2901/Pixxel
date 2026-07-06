@@ -417,6 +417,28 @@ const check = (label, cond, detail = '') => {
   check('evaluateSelfTest rejects a whole-frame matte',
     badSeg.ok === false)
 
+  const withSam = evaluateSelfTest(
+    {
+      ground: { found: true, score: 0.96, bbox: [40, 70, 120, 120] },
+      depth: { width: 320, height: 240, spread: 0.8 },
+      sam: { width: 320, height: 240, coverage: 0.11, bbox: [42, 72, 118, 118] },
+    },
+    { cx: 100, cy: 130, w: 320, h: 240 },
+  )
+  check('evaluateSelfTest passes a sane click-select mask',
+    withSam.ok === true && withSam.checks.length === 6)
+
+  const badSam = evaluateSelfTest(
+    {
+      ground: { found: true, score: 0.96, bbox: [40, 70, 120, 120] },
+      depth: { width: 320, height: 240, spread: 0.8 },
+      sam: { width: 320, height: 240, coverage: 0.12, bbox: [200, 10, 60, 60] },
+    },
+    { cx: 100, cy: 130, w: 320, h: 240 },
+  )
+  check('evaluateSelfTest fails an off-click SAM mask',
+    badSam.ok === false)
+
   const timedOut = await withTimeout(new Promise(() => {}), 30, 'hang').then(
     () => false,
     (e) => /timed out/.test(e.message),

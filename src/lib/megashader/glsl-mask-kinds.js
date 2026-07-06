@@ -535,7 +535,7 @@ export const buildSmartBrush = (slot) => /* glsl */ `
 
         float evalLayer_${slot}_body() {
             // Compile-time loop bound. The runtime filterRadius is the
-            // actual cutoff (see the abs(dx)/abs(dy) > radiusI guards).
+            // actual cutoff (see the radius guards inside the loop below).
             const int MAX_RADIUS = 8;
             int radiusI = int(uLayer_${slot}_kind_smartBrush_filterRadius + 0.5);
             if (radiusI < 1) radiusI = 1;
@@ -568,9 +568,13 @@ export const buildSmartBrush = (slot) => /* glsl */ `
                 for (int dx = -MAX_RADIUS; dx <= MAX_RADIUS; dx += 1) {
                     // Skip neighbours outside the actual radius. Using a
                     // continue instead of two nested loops so the loop
-                    // bounds stay GLSL-ES-1.00-legal.
-                    if (abs(dx) > radiusI) continue;
-                    if (abs(dy) > radiusI) continue;
+                    // bounds stay GLSL-ES-1.00-legal. NB: GLSL ES 1.00 has
+                    // no integer abs() overload (that arrived in ES 3.00),
+                    // so cast to float before abs — abs(int) fails to
+                    // compile and takes the whole program down to CPU
+                    // passthrough (every smart-brush mask a silent no-op).
+                    if (abs(float(dx)) > float(radiusI)) continue;
+                    if (abs(float(dy)) > float(radiusI)) continue;
                     vec2 offset = vec2(float(dx), float(dy)) / uImageSize;
                     vec2 sampleUV = vTextureCoord + offset;
                     // Defensive clamp: CLAMP_TO_EDGE on the texture means

@@ -30,14 +30,39 @@
 
 import { filters, classRegistry } from 'fabric'
 import { renderMegashader, disposeRenderer } from './megashader-renderer'
-import { getMaskTexture, setMaskTexture } from './mask-types'
+import { getMaskTexture, setMaskTexture, semanticLayer } from './mask-types'
+import { buildPackedLutFromCurves } from '../curve-lut'
+
+// Base (whole-image pre-grade) helpers — gate + full-white mask texture.
+const baseHasGrade = (b) => !!b && (
+    (typeof b.gamma === 'number' && Math.abs(b.gamma - 1) > 1e-3)
+    || !!b.curveLutKey
+    || [b.wheelShadows, b.wheelMidtones, b.wheelHighlights]
+        .some((w) => Array.isArray(w) && w.some((n) => Number.isFinite(n) && n !== 0))
+)
+const ensureWhiteTexture = (w, h) => {
+    const key = `base-white-${w}x${h}`
+    if (!getMaskTexture(key)) {
+        const c = document.createElement('canvas')
+        c.width = w
+        c.height = h
+        const ctx = c.getContext('2d')
+        ctx.fillStyle = '#fff'
+        ctx.fillRect(0, 0, w, h)
+        setMaskTexture(key, c)
+    }
+    return key
+}
 
 const MEGASHADER_FILTER_TYPE = 'Megashader'
 
 // Field names that carry an opaque mask-texture-cache key, by kind. Used to
 // serialise/restore the per-layer textures (semantic / depth / smartBrush /
 // lasso) so a persisted chain survives save → reload.
-const TEXTURE_KEY_FIELDS = ['maskTextureKey', 'brushTextureKey', 'depthMapKey']
+// baseTextureKey: the Boundary slider's pristine base — without it a reload
+// grows from the already-grown mask (cumulative drift). The textures map is
+// keyed by texture key, so base === mask (the common case) dedupes to one entry.
+const TEXTURE_KEY_FIELDS = ['maskTextureKey', 'baseTextureKey', 'brushTextureKey', 'depthMapKey']
 
 /**
  * Convert a cached texture (ImageData | HTMLCanvasElement | HTMLImageElement |
@@ -112,7 +137,14 @@ export class MegashaderFilter extends filters.BaseFilter {
      */
     constructor(options = {}) {
         super()
-        this.type = MEGASHADER_FILTER_TYPE
+        // NB: do NOT assign `this.type` here. In Fabric v7 `BaseFilter.type`
+        // is a getter (`get type() { return this.constructor.type }`) with no
+        // setter, so `this.type = …` throws a TypeError. The type is declared
+        // as a STATIC property below (mirroring PhosmithCurvesFilter). Before
+        // this fix the throw propagated out of `applyMegashaderFilter` and was
+        // swallowed by canvas.jsx's `doApply().catch()`, so NO mask layer ever
+        // rendered in the editor (mask-studio was unaffected — it calls
+        // `renderMegashader` directly and never constructs this filter).
         // No fragmentSource — the renderer compiles the real source via its
         // own private WebGL2 context. This filter implements applyTo2d() to
         // integrate with Fabric v7's Canvas2D filter pipeline.
@@ -174,9 +206,35 @@ export class MegashaderFilter extends filters.BaseFilter {
             ctx.putImageData(options.imageData, 0, 0)
         }
 
+        // Pass 1 (base grade): pre-bake the whole-image grade into the source,
+        // because per-layer grading samples the ORIGINAL source — without the
+        // pre-pass, other layers' masked regions would lose the base grade.
+        let source = canvasEl
+        const base = this.stack && this.stack.base
+        if (baseHasGrade(base)) {
+            try {
+                const whiteKey = ensureWhiteTexture(canvasEl.width, canvasEl.height)
+                const baseLayer = {
+                    ...semanticLayer({ maskTextureKey: whiteKey, feather: 0, label: 'Base' }),
+                    id: 'base',
+                    fillMode: 'adjust',
+                    gamma: base.gamma,
+                    curves: base.curves,
+                    curveLutKey: base.curveLutKey,
+                    wheelShadows: base.wheelShadows,
+                    wheelMidtones: base.wheelMidtones,
+                    wheelHighlights: base.wheelHighlights,
+                }
+                const pre = renderMegashader(canvasEl, { chain: [{ op: 'replace', layer: baseLayer }] }, {})
+                if (pre) source = pre
+            } catch (e) {
+                console.warn('[megashader] base pre-grade failed, skipping:', e)
+            }
+        }
+
         let result
         try {
-            result = renderMegashader(canvasEl, this.stack, {
+            result = renderMegashader(source, this.stack, {
                 globalMaskAlpha: this.globalMaskAlpha,
                 globalInvert: this.globalInvert,
                 maskOverlay: this.maskOverlay,
@@ -186,6 +244,8 @@ export class MegashaderFilter extends filters.BaseFilter {
             console.warn('[megashader] render failed, passing through source:', e)
             return  // Leave pipelineState unchanged — passthrough.
         }
+        // Base-only stack (no layers): pass-1 output IS the result.
+        if (!result && source !== canvasEl) result = source
 
         if (!result) return  // Passthrough — renderMegashader returned null.
 
@@ -264,6 +324,21 @@ export class MegashaderFilter extends filters.BaseFilter {
                 Object.entries(textures).map(([key, url]) => restoreTexture(key, url)),
             )
         }
+        // Rebuild curve LUTs (per-layer + base) from their persisted points.
+        // The LUT texture is never serialised (curves are the source of truth),
+        // and the renderer null-skips a missing LUT — so without this, saved
+        // tone curves silently stop rendering until the user re-touches a curve.
+        const gradeCarriers = (Array.isArray(object?.stack?.chain) ? object.stack.chain : []).map((e) => e && e.layer)
+        if (object?.stack?.base) gradeCarriers.push(object.stack.base)
+        if (typeof ImageData !== 'undefined') {
+            for (const layer of gradeCarriers) {
+                if (!layer?.curves || !layer?.curveLutKey || getMaskTexture(layer.curveLutKey)) continue
+                try {
+                    const { packed, identity } = buildPackedLutFromCurves(layer.curves)
+                    if (!identity) setMaskTexture(layer.curveLutKey, new ImageData(new Uint8ClampedArray(packed), 256, 1))
+                } catch { /* corrupt curves — layer renders uncurved */ }
+            }
+        }
         const filter = new MegashaderFilter({
             stack: object?.stack,
             globalMaskAlpha: object?.globalMaskAlpha,
@@ -275,6 +350,12 @@ export class MegashaderFilter extends filters.BaseFilter {
         return filter
     }
 }
+
+// Declare the class type as a STATIC property (Fabric v7's instance `type`
+// getter returns `this.constructor.type`). This is the sanctioned way to set
+// a filter's type in v7 — the same pattern PhosmithCurvesFilter uses — and it
+// replaces the illegal `this.type = …` instance assignment in the constructor.
+Object.defineProperty(MegashaderFilter, 'type', { value: MEGASHADER_FILTER_TYPE })
 
 // Register with Fabric's classRegistry so `loadFromJSON` can rehydrate
 // `type: "Megashader"` filters. Importing this file is the side effect

@@ -138,7 +138,12 @@ export const bboxOfMaskCanvas = (canvas, thresh = 24) => {
 
 const errorFromResponse = async (resp, fallback) => {
     const j = await resp.json().catch(() => null)
-    return new Error(j?.error || `${fallback} (${resp.status})`)
+    const err = new Error(j?.error || `${fallback} (${resp.status})`)
+    // Carry the HTTP status so callers can tell permanent conditions (501 =
+    // model not installed on the service, 404 = route missing) from transient
+    // ones and stop retrying the server per interaction.
+    err.status = resp.status
+    return err
 }
 
 /** GET /api/ai/health — is the masking service up, and is SAM 3.1 loaded? */
@@ -157,7 +162,7 @@ export const checkMaskService = async (timeoutMs = 4000) => {
 }
 
 /**
- * POST /api/ai/sam2 — point-click selection. `points` are [[x, y], ...] and
+ * POST /api/ai/sam3 — point-click selection. `points` are [[x, y], ...] and
  * `labels` [1|0, ...] in ORIGINAL image coords. Returns a coverage canvas at
  * (width, height) (defaults to the natural image size).
  */
@@ -171,7 +176,7 @@ export const serviceSamClick = async (sourceEl, points, labels, { width, height,
     const form = new FormData()
     form.append('image', up.blob, 'image.jpg')
     form.append('clicks', JSON.stringify(clicks))
-    const r = await fetch('/api/ai/sam2', { method: 'POST', body: form, signal })
+    const r = await fetch('/api/ai/sam3', { method: 'POST', body: form, signal })
     if (!r.ok) throw await errorFromResponse(r, 'SAM click failed')
     const blob = await r.blob()
     const url = URL.createObjectURL(blob)
@@ -183,7 +188,7 @@ export const serviceSamClick = async (sourceEl, points, labels, { width, height,
 }
 
 /**
- * POST /api/ai/sam2 — box-prompted selection. `box` is [x0, y0, x1, y1] in
+ * POST /api/ai/sam3 — box-prompted selection. `box` is [x0, y0, x1, y1] in
  * ORIGINAL image coords. Returns a coverage canvas at (width, height).
  */
 export const serviceSamBox = async (sourceEl, box, { width, height, signal } = {}) => {
@@ -198,7 +203,7 @@ export const serviceSamBox = async (sourceEl, box, { width, height, signal } = {
     const form = new FormData()
     form.append('image', up.blob, 'image.jpg')
     form.append('box', JSON.stringify(scaled))
-    const r = await fetch('/api/ai/sam2', { method: 'POST', body: form, signal })
+    const r = await fetch('/api/ai/sam3', { method: 'POST', body: form, signal })
     if (!r.ok) throw await errorFromResponse(r, 'SAM box failed')
     const blob = await r.blob()
     const url = URL.createObjectURL(blob)

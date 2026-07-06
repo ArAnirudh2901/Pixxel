@@ -1583,6 +1583,7 @@ const AdjustControls = () => {
                             min={cfg.min}
                             max={cfg.max}
                             step={cfg.step}
+                            defaultValue={cfg.defaultValue}
                             label={cfg.label}
                             suffix={cfg.suffix ?? ""}
                             visual={FILTER_VISUAL[cfg.key] || FILTER_VISUAL.brightness}

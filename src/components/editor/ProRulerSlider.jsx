@@ -1,6 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
+import { RotateCcw } from "lucide-react"
 
 const TICK_COUNT = 51
 
@@ -47,6 +48,7 @@ export function ProRulerSlider({
   disabled = false,
   variant = "instrument",
   visual = {},
+  defaultValue,
   onBegin,
   onPreview,
   onCommit,
@@ -218,6 +220,39 @@ export function ProRulerSlider({
     onChange?.(v)
   }
 
+  // Reset this single slider to its default. Reused by double-click-to-reset on
+  // the track and the explicit reset affordance shown when the value is off-default.
+  const hasDefault = defaultValue != null
+  const isOffDefault = hasDefault && Number(value) !== Number(defaultValue)
+  const handleReset = useCallback(
+    (e) => {
+      e?.preventDefault?.()
+      e?.stopPropagation?.()
+      if (disabled || !hasDefault) return
+      const v = snapValue(defaultValue)
+      onBegin?.()
+      applyVisual(v)
+      onCommit?.(v)
+      onChange?.(v)
+    },
+    [applyVisual, defaultValue, disabled, hasDefault, onBegin, onChange, onCommit, snapValue]
+  )
+
+  const resetButton = isOffDefault ? (
+    <button
+      type="button"
+      className="pro-ruler-reset"
+      // Guard against the track's pointerdown starting a drag on the same press.
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={handleReset}
+      tabIndex={disabled ? -1 : 0}
+      aria-label={`Reset ${label}`}
+      title={`Reset ${label}`}
+    >
+      <RotateCcw aria-hidden="true" />
+    </button>
+  ) : null
+
   const trackStyle = {
     "--pro-ruler-fill": fill,
     "--pro-ruler-accent": accent,
@@ -259,6 +294,7 @@ export function ProRulerSlider({
     "aria-disabled": disabled,
     onKeyDown: handleKeyDown,
     onPointerDown: handlePointerDown,
+    onDoubleClick: hasDefault ? handleReset : undefined,
   }
 
   if (isStudio) {
@@ -272,6 +308,7 @@ export function ProRulerSlider({
               {suffix}
             </span>
           </div>
+          {resetButton}
         </div>
       </div>
     )
@@ -280,6 +317,7 @@ export function ProRulerSlider({
   return (
     <div ref={rootRef} className={sliderClass} style={trackStyle}>
       <div {...trackProps}>{trackDecor}</div>
+      {resetButton}
     </div>
   )
 }

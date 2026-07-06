@@ -256,6 +256,18 @@ const log = (ok, name, detail) => {
     const bodyMatch = c.frag.match(/float\s+evalLayer_0_body\s*\(\s*\)\s*\{[\s\S]*?\n\s*\}/)
     const body = bodyMatch?.[0] || ''
     log(body.includes('rgbToHsb'), 'color body calls rgbToHsb')
+    // Regression guard: GLSL has no forward declarations, so the shared
+    // rgbToHsb helper MUST be defined earlier in the assembled fragment than
+    // the color mask body that calls it. When it sat below the mask-function
+    // block the color shader failed to compile ("rgbToHsb: no matching
+    // overloaded function") and the whole program fell back to CPU
+    // passthrough — every colour-range mask rendered as a no-op.
+    {
+        const defIdx = c.frag.indexOf('vec3 rgbToHsb(')
+        const callIdx = c.frag.indexOf('rgbToHsb(rgb)')
+        log(defIdx >= 0 && callIdx >= 0 && defIdx < callIdx,
+            'rgbToHsb is defined BEFORE the color body that calls it (GLSL has no forward decls)')
+    }
     // Cyclic hue distance uses both `abs(...)` and a `360.0 - ...` fold.
     log(
         body.includes('360.0 - diffH') || body.includes('360.0 - abs(hsb.x'),
@@ -573,7 +585,14 @@ const log = (ok, name, detail) => {
     const body = bodyMatch?.[0] || ''
     log(body.includes('MAX_RADIUS'), 'smartBrush body uses a compile-time MAX_RADIUS constant')
     log(/for\s*\(\s*int\s+dy\s*=/.test(body) && /for\s*\(\s*int\s+dx\s*=/.test(body), 'smartBrush body has nested for loops over dx/dy')
-    log(body.includes('abs(dx) > radiusI') || body.includes('abs(dx)>radiusI'), 'smartBrush body guards the inner loop by the actual radius')
+    log(/abs\(\s*float\(\s*dx\s*\)\s*\)\s*>\s*float\(\s*radiusI\s*\)/.test(body), 'smartBrush body guards the inner loop by the actual radius')
+    // Regression guard: GLSL ES 1.00 has no integer abs() overload (added in
+    // ES 3.00), so the guard MUST cast to float. A bare abs(dx)/abs(dy) fails
+    // to compile and silently drops the whole program to CPU passthrough,
+    // making every smart-brush mask a no-op. Strip // comments first so the
+    // check tests the actual GLSL code, not prose that mentions abs(dx).
+    const codeOnly = body.replace(/\/\/[^\n]*/g, '')
+    log(!/abs\(\s*d[xy]\s*\)/.test(codeOnly), 'smartBrush body avoids the ES-1.00-illegal integer abs()')
     // The non-greedy regex above stops at the first inner `}` (the inner
     // for-loop's closing brace), so any assertion past that needs to match
     // against the whole fragment. The normalisation guard and UV clamp
@@ -1337,29 +1356,29 @@ const log = (ok, name, detail) => {
         path.dirname(new URL(import.meta.url).pathname),
         '..', 'src', 'app', '(main)', 'editor', '[projectId]', '_components', 'tools', '_megashader-test-panel.jsx',
     )
-    const src = fs.readFileSync(file, 'utf8')
-    // The poller effect body must compare a key field against a previous
-    // value (any of: `lastRef`, `prev === next`, `shallowEqual`, etc.).
-    // The simplest regression guard: at least one `===` (or `!==`) check
-    // appears inside the interval body.
-    const intervalBody = src.match(/setInterval\(\(\)\s*=>\s*\{([\s\S]*?)\},\s*250\s*\)/)
-    const hasCompare = intervalBody ? /[!=]==/.test(intervalBody[1]) : false
-    log(hasCompare, 'test-panel metrics poller compares snapshots (no unconditional 4×/sec re-render)')
-}
+    // The dev-only `_megashader-test-panel.jsx` was removed from the shipping
+    // editor; checks 83/84 only apply if it's present. Skip gracefully when
+    // absent so the suite doesn't hard-crash on a `readFileSync` ENOENT.
+    if (!fs.existsSync(file)) {
+        console.log('\x1b[33m∅\x1b[0m test-panel checks 83/84 skipped — _megashader-test-panel.jsx not present')
+    } else {
+        const src = fs.readFileSync(file, 'utf8')
+        // The poller effect body must compare a key field against a previous
+        // value (any of: `lastRef`, `prev === next`, `shallowEqual`, etc.).
+        // The simplest regression guard: at least one `===` (or `!==`) check
+        // appears inside the interval body.
+        const intervalBody = src.match(/setInterval\(\(\)\s*=>\s*\{([\s\S]*?)\},\s*250\s*\)/)
+        const hasCompare = intervalBody ? /[!=]==/.test(intervalBody[1]) : false
+        log(hasCompare, 'test-panel metrics poller compares snapshots (no unconditional 4×/sec re-render)')
 
-// 84. The test panel's `setInterval` must be paired with a `clearInterval`
-//     cleanup. Verifies the unmount path doesn't leak the timer.
-{
-    const fs = await import('node:fs')
-    const file = 'src/app/(main)/editor/[projectId]/_components/tools/_megashader-test-panel.jsx'
-    const src = fs.readFileSync(file, 'utf8')
-    // Look for the `useEffect` body that contains `setInterval` and
-    // confirm it returns a cleanup that calls `clearInterval`.
-    const hasInterval = /setInterval\(/.test(src)
-    const hasClear = /clearInterval\(/.test(src)
-    const cleanupAfterInterval = /setInterval\([\s\S]{0,800}?return\s*\(\)\s*=>\s*clearInterval/.test(src)
-    log(hasInterval && hasClear && cleanupAfterInterval,
-        'test-panel setInterval is paired with clearInterval cleanup')
+        // 84. The test panel's `setInterval` must be paired with a
+        //     `clearInterval` cleanup. Verifies the unmount path doesn't leak.
+        const hasInterval = /setInterval\(/.test(src)
+        const hasClear = /clearInterval\(/.test(src)
+        const cleanupAfterInterval = /setInterval\([\s\S]{0,800}?return\s*\(\)\s*=>\s*clearInterval/.test(src)
+        log(hasInterval && hasClear && cleanupAfterInterval,
+            'test-panel setInterval is paired with clearInterval cleanup')
+    }
 }
 
 // 85. `handleSemanticRun` must read its running flag from a ref

@@ -230,9 +230,9 @@ const OPS = [
 
 // Per-layer output modes (root-cause #1). Matches FILL_MODES in mask-types.
 const FILL_MODE_OPTIONS = [
-    { id: 'fill', label: 'Fill' },
-    { id: 'adjust', label: 'Adjust' },
-    { id: 'erase', label: 'Erase' },
+    { id: 'fill', label: 'Fill', hint: 'Tint the masked region (visible selection)' },
+    { id: 'adjust', label: 'Adjust', hint: 'Use the mask for adjustments only' },
+    { id: 'erase', label: 'Erase', hint: 'Cut the ENTIRE masked region out — use “Erase region” below to remove just part of it' },
 ]
 
 // Convert a {r,g,b} (0..1) fill colour to a #rrggbb hex string for the
@@ -772,7 +772,7 @@ export function MaskChainCard({
     entry, index, total, isFirst,
     onUpdate, onRemove, onMove, onSetOp, onSetFillMode,
     selected, onSelect,
-    dominantColor, imageSize, onExpandBoundary,
+    dominantColor, imageSize, onExpandBoundary, onRefineRegion,
     onApplyCurve, histogram,
 }) {
     const layer = entry.layer
@@ -896,6 +896,7 @@ export function MaskChainCard({
                             key={m.id}
                             type="button"
                             disabled={locked}
+                            title={m.hint}
                             onClick={() => (onSetFillMode ? onSetFillMode(layer.id, m.id) : onUpdate({ fillMode: m.id }))}
                             className={`mask-fill-mode-btn ${active ? 'mask-fill-mode-btn--active' : ''}`}
                         >
@@ -955,6 +956,36 @@ export function MaskChainCard({
                     locked={locked}
                     onCommit={(px) => onExpandBoundary(layer.id, px)}
                 />
+            )}
+
+            {/* Region refine: paint a sub-region to carve out of / add to
+                THIS layer's mask — unlike the Erase output mode above, which
+                knocks out the entire masked region. */}
+            {typeof onRefineRegion === 'function'
+                && GROWABLE_KINDS.includes(layer.kind)
+                && (layer.maskTextureKey || layer.brushTextureKey) && (
+                <div className="grid grid-cols-2 gap-1.5 mt-1.5">
+                    <button
+                        type="button"
+                        disabled={locked}
+                        onClick={() => onRefineRegion(layer.id, 'erase')}
+                        className="mask-fill-mode-btn flex items-center justify-center gap-1 disabled:opacity-40"
+                        title="Paint a region to remove from this mask — the rest of the layer stays"
+                    >
+                        <Eraser className="h-3 w-3" />
+                        Erase region
+                    </button>
+                    <button
+                        type="button"
+                        disabled={locked}
+                        onClick={() => onRefineRegion(layer.id, 'add')}
+                        className="mask-fill-mode-btn flex items-center justify-center gap-1 disabled:opacity-40"
+                        title="Paint a new region to add to this mask"
+                    >
+                        <Paintbrush className="h-3 w-3" />
+                        Add region
+                    </button>
+                </div>
             )}
 
             <label className="mask-toggle mt-2">

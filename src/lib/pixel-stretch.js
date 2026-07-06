@@ -91,6 +91,9 @@ const warpPatches = (grid) => ({ pr: (grid.length - 1) / 3, pc: (grid[0].length 
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi)
 const clamp01 = (v) => clamp(v, 0, 1)
+// clamp() is NaN-transparent (Math.min/max propagate NaN) — sanitizers must
+// coerce non-finite input to a fallback first.
+const num = (v, d) => (Number.isFinite(v) ? v : d)
 
 // ─── Warp Grid (Photoshop-style 4×4 control point mesh) ─────────────────────
 
@@ -122,7 +125,7 @@ export function getWarpRest(params = DEFAULT_STRETCH) {
 }
 
 /** Snap a requested dimension to the nearest valid net size (3·patches+1). */
-const snapNetDim = (n) => clamp(Math.round((Math.round(n) - 1) / 3) * 3 + 1, WARP_MIN_DIM, WARP_MAX_DIM)
+const snapNetDim = (n) => clamp(Math.round((Math.round(num(n, WARP_MIN_DIM)) - 1) / 3) * 3 + 1, WARP_MIN_DIM, WARP_MAX_DIM)
 
 /**
  * Create a default warp control net — points evenly spaced over the rest
@@ -222,24 +225,26 @@ export function getPolygonBBox(poly) {
 export function clampStretchParams(p = {}) {
   const base = { ...DEFAULT_STRETCH, ...p }
   const band = { ...DEFAULT_STRETCH.band, ...(p.band || {}) }
+  const D = DEFAULT_STRETCH
   // Keep the band inside the image and give it a non-zero footprint.
-  band.w = clamp(band.w, 0.01, 1)
-  band.h = clamp(band.h, 0.01, 1)
-  band.x = clamp(band.x, 0, 1 - band.w)
-  band.y = clamp(band.y, 0, 1 - band.h)
+  // NaN/Infinity (model/UI-supplied) fall back to defaults before clamping.
+  band.w = clamp(num(band.w, D.band.w), 0.01, 1)
+  band.h = clamp(num(band.h, D.band.h), 0.01, 1)
+  band.x = clamp(num(band.x, D.band.x), 0, 1 - band.w)
+  band.y = clamp(num(band.y, D.band.y), 0, 1 - band.h)
   return {
     axis: base.axis === 'horizontal' ? 'horizontal' : 'vertical',
     direction: base.direction < 0 ? -1 : 1,
     band,
     polygon: sanitizePolygon(base.polygon),
-    seed: clamp01(base.seed),
-    length: clamp(base.length, 1, 8),
-    bend: clamp(base.bend, -1, 1),
-    twist: clamp(base.twist, -1, 1),
-    fade: clamp01(base.fade),
-    taper: clamp(base.taper, -1, 1),   // <0 flares the tip wider, >0 narrows it
+    seed: clamp01(num(base.seed, D.seed)),
+    length: clamp(num(base.length, D.length), 1, 8),
+    bend: clamp(num(base.bend, D.bend), -1, 1),
+    twist: clamp(num(base.twist, D.twist), -1, 1),
+    fade: clamp01(num(base.fade, D.fade)),
+    taper: clamp(num(base.taper, D.taper), -1, 1),   // <0 flares the tip wider, >0 narrows it
     mirror: Boolean(base.mirror),
-    opacity: clamp01(base.opacity),
+    opacity: clamp01(num(base.opacity, D.opacity)),
     warpGrid: sanitizeWarpGrid(base.warpGrid),
     warpRest: sanitizeWarpRest(base.warpRest),
     flowPath: sanitizeFlowPath(base.flowPath),
@@ -337,6 +342,8 @@ function resolveGeometry(p, W, H, dir = p.direction) {
  * can draw draggable controls without re-deriving the geometry.
  */
 export function getStretchAnchors(params, W = 1, H = 1) {
+  W = num(W, 1) > 0 ? num(W, 1) : 1
+  H = num(H, 1) > 0 ? num(H, 1) : 1
   const p = clampStretchParams(params)
   const g = resolveGeometry(p, W, H)
   const mid = cubic(g.start, g.c1, g.c2, g.end, 0.5)
@@ -356,6 +363,8 @@ export function getStretchAnchors(params, W = 1, H = 1) {
  * guide curve. Aspect ratio (H/W) must match the render target.
  */
 export function getStretchPath(params, W = 1, H = 1, samples = 48) {
+  W = num(W, 1) > 0 ? num(W, 1) : 1
+  H = num(H, 1) > 0 ? num(H, 1) : 1
   const p = clampStretchParams(params)
   const g = resolveGeometry(p, W, H)
   const pts = []
@@ -1088,6 +1097,7 @@ export const WARP_PRESETS = [
  * @param {number} [cols]  Override grid cols (defaults to current/4).
  */
 export function applyWarpPreset(params, presetId, amount = 1, rows, cols) {
+  amount = clamp(num(amount, 1), -2, 2)
   const p = clampStretchParams(params)
   const R = snapNetDim(rows || (p.warpGrid ? p.warpGrid.length : WARP_DEFAULT_ROWS))
   const C = snapNetDim(cols || (p.warpGrid ? p.warpGrid[0].length : WARP_DEFAULT_COLS))

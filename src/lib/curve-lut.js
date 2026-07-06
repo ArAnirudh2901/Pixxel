@@ -109,6 +109,8 @@ export const buildLut = (points) => {
 export const buildCurveSvgPath = (points, viewBox) => {
     const pts = normalizePoints(points)
     const { left, right, top, bottom } = viewBox
+    // A non-finite viewBox would emit "NaN" into the path data.
+    if (![left, right, top, bottom].every(Number.isFinite)) return ''
     const w = right - left
     const h = bottom - top
     const X = (x) => left + x * w

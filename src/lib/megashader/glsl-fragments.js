@@ -106,17 +106,9 @@ export const buildFragmentTemplate = () => /* glsl */ `
     uniform float uMaskOverlay;
     uniform vec3 uMaskOverlayColor;
 
-    {{MASK_FUNCTIONS}}
-
-    {{ADJUST_FUNCTIONS}}
-
-    {{EVAL_DISPATCHER}}
-
-    /**
-     * Branchless RGB → HSB conversion (Hue in degrees 0..360, S and B 0..1).
-     * Standard implementation, included up-front so Step 2's color mask can
-     * call it without a separate code path.
-     */
+    // RGB → HSB (H in degrees). MUST stay above the mask-function block:
+    // GLSL has no forward decls, and the color kind calls this. (Don't put
+    // placeholder tokens in comments — substitution is first-match replace.)
     vec3 rgbToHsb(vec3 c) {
         float maxC = max(max(c.r, c.g), c.b);
         float minC = min(min(c.r, c.g), c.b);
@@ -132,6 +124,12 @@ export const buildFragmentTemplate = () => /* glsl */ `
         }
         return vec3(h, s, b);
     }
+
+    {{MASK_FUNCTIONS}}
+
+    {{ADJUST_FUNCTIONS}}
+
+    {{EVAL_DISPATCHER}}
 
     void main() {
         vec4 src = texture2D(uImage, vTextureCoord);

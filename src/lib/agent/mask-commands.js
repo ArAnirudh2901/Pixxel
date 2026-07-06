@@ -510,12 +510,12 @@ export const createMaskCommands = ({ getPrimaryImage }) => {
             },
         },
         addSubjectClicks: {
-            description: 'AI (SAM2): click-select a subject. clicks = [[x,y,label=1|0], …] in image-pixel coords.',
+            description: 'AI (SAM 3.1): click-select a subject. clicks = [[x,y,label=1|0], …] in image-pixel coords.',
             params: { clicks: 'Array<[x,y,label]>', fillMode: 'string' },
             run: async (a) => {
                 const clicks = Array.isArray(a.clicks) ? a.clicks : []
                 if (!clicks.length) throw new Error('[agent.mask] addSubjectClicks needs >=1 click')
-                const maskBlob = await postMask('/api/ai/sam2', (form, scale) => {
+                const maskBlob = await postMask('/api/ai/sam3', (form, scale) => {
                     form.append('clicks', JSON.stringify(clicks.map(([x, y, l]) => [x * scale, y * scale, l ?? 1])))
                 })
                 const cover = toCoverageCanvas(await decodePng(maskBlob))
@@ -525,7 +525,7 @@ export const createMaskCommands = ({ getPrimaryImage }) => {
             },
         },
         addSubjectBox: {
-            description: 'AI (SAM2): box-select the object inside a rectangle — SAM 2\'s strongest single prompt for whole objects. box = [x, y, w, h] in image-pixel coords; optional clicks refine it.',
+            description: 'AI (SAM 3.1): box-select the object inside a rectangle — SAM 3.1\'s strongest single prompt for whole objects. box = [x, y, w, h] in image-pixel coords; optional clicks refine it.',
             params: { box: '[x, y, w, h] image px', clicks: 'optional Array<[x,y,label]>', fillMode: 'string' },
             run: async (a) => {
                 const b = Array.isArray(a.box) && a.box.length === 4 ? a.box.map(Number) : null
@@ -533,7 +533,7 @@ export const createMaskCommands = ({ getPrimaryImage }) => {
                     throw new Error('[agent.mask] addSubjectBox needs box = [x, y, w, h]')
                 }
                 const clicks = Array.isArray(a.clicks) ? a.clicks : []
-                const maskBlob = await postMask('/api/ai/sam2', (form, scale) => {
+                const maskBlob = await postMask('/api/ai/sam3', (form, scale) => {
                     form.append('box', JSON.stringify([
                         b[0] * scale, b[1] * scale,
                         (b[0] + b[2]) * scale, (b[1] + b[3]) * scale,
@@ -560,7 +560,7 @@ export const createMaskCommands = ({ getPrimaryImage }) => {
             },
         },
         fromDescription: {
-            description: 'AI: mask a region described in natural language (e.g. "the dog on the left", "everything except the sky", "the shadows but not the person", "the red jacket, extend by 12px"). Plans with Gemini (heuristic fallback), then resolves via instance detection, text grounding (CLIPSeg+SAM2), depth, luminance, colour or geometry, composing multiple parts with add/subtract/intersect. Returns {plan, layers, notes}.',
+            description: 'AI: mask a region described in natural language (e.g. "the dog on the left", "everything except the sky", "the shadows but not the person", "the red jacket, extend by 12px"). Plans with Gemini (heuristic fallback), then resolves via instance detection, text grounding (CLIPSeg+SAM 3.1), depth, luminance, colour or geometry, composing multiple parts with add/subtract/intersect. Returns {plan, layers, notes}.',
             params: {
                 description: 'string — the region in plain language',
                 fillMode: 'string fill|adjust|erase (overrides the language)',

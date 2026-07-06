@@ -47,7 +47,7 @@ const journalMaskEdit = (label) => {
 const MAX_STACK_HISTORY = 50
 
 export const useMaskLayers = () => {
-    const initial = useMemo(() => ({ chain: [] }), [])
+    const initial = useMemo(() => ({ chain: [], base: null }), [])
     const [stack, dispatch] = useReducer(reducer, initial)
     const isReady = true
     const lastSignatureRef = useRef(null)
@@ -72,17 +72,31 @@ export const useMaskLayers = () => {
 
     const snapshot = useCallback(() => {
         const chain = stackRef.current?.chain || []
+        const base = stackRef.current?.base || null
         // structuredClone keeps the snapshot independent of later mutations;
         // textures live in the module cache keyed by string, so cloning the
         // chain (which only holds the key strings) is sufficient.
         try {
-            pastRef.current.push(structuredClone(chain))
+            pastRef.current.push(structuredClone({ chain, base }))
         } catch {
-            pastRef.current.push(chain.map((e) => ({ op: e.op, layer: { ...e.layer } })))
+            pastRef.current.push({
+                chain: chain.map((e) => ({ op: e.op, layer: { ...e.layer } })),
+                base: base ? { ...base } : null,
+            })
         }
         if (pastRef.current.length > MAX_STACK_HISTORY) pastRef.current.shift()
         futureRef.current = []
     }, [])
+
+    // One history entry per param-edit burst (grade sliders, gamma, wheels,
+    // boundary): snapshot before the FIRST change, then coalesce while edits
+    // keep arriving within 350 ms of each other.
+    const paramSnapAtRef = useRef(0)
+    const paramSnapshot = useCallback(() => {
+        const now = Date.now()
+        if (now - paramSnapAtRef.current > 350) snapshot()
+        paramSnapAtRef.current = now
+    }, [snapshot])
 
     // Notify subscribers on EVERY stack change. We use a custom event on
     // `window` (matching the codebase's phosmith:* convention — see page.jsx's
@@ -167,6 +181,14 @@ export const useMaskLayers = () => {
                 layer.lock = false
             }
         }
+        // Boundary-grow fields ride through the kind factories (which whitelist
+        // their params): the pristine base + absolute grow offset.
+        if (layer && typeof params.baseTextureKey === 'string' && params.baseTextureKey) {
+            layer.baseTextureKey = params.baseTextureKey
+        }
+        if (layer && typeof params.growPx === 'number') {
+            layer.growPx = params.growPx
+        }
         // Root-cause #1: new layers default to 'fill' mode so the selection
         // is visible the instant it's added (no slider drag required). The
         // factory default is 'adjust'; we override here unless the caller
@@ -199,11 +221,11 @@ export const useMaskLayers = () => {
     }, [snapshot])
 
     const updateLayer = useCallback((id, patch) => {
-        // Param edits (slider drags) are not snapshotted — they'd flood the
-        // undo ring. Structural changes (add/remove/move/op/fillMode/clear)
-        // each take their own snapshot.
+        // Burst-debounced snapshot so grade/param edits are undoable without
+        // flooding the ring (one entry per drag, not per tick).
+        paramSnapshot()
         dispatch({ type: 'update', id, patch })
-    }, [])
+    }, [paramSnapshot])
 
     // Root-cause #1: change a layer's output mode (adjust/fill/erase). This
     // IS snapshotted (it's a meaningful, undoable change, unlike a slider).
@@ -258,23 +280,39 @@ export const useMaskLayers = () => {
     // chain; the canvas effect re-applies the megashader on the resulting
     // change. Bound to the same phosmith:mask-undo/redo events below so the
     // global Ctrl+Z path can drive them when the Mask tool owns undo.
+    const currentEntry = () => {
+        const chain = stackRef.current?.chain || []
+        const base = stackRef.current?.base || null
+        try { return structuredClone({ chain, base }) }
+        catch { return { chain: chain.map((e) => ({ op: e.op, layer: { ...e.layer } })), base: base ? { ...base } : null } }
+    }
+    // Entries are { chain, base }; tolerate bare chain arrays (older shape).
+    const restoreEntry = (entry) => {
+        const chain = Array.isArray(entry) ? entry : entry?.chain || []
+        const base = Array.isArray(entry) ? stackRef.current?.base || null : entry?.base || null
+        dispatch({ type: 'restore', chain, base })
+    }
+
     const undo = useCallback(() => {
         if (pastRef.current.length === 0) return false
         const prev = pastRef.current.pop()
-        try { futureRef.current.push(structuredClone(stackRef.current.chain)) }
-        catch { futureRef.current.push(stackRef.current.chain.map((e) => ({ op: e.op, layer: { ...e.layer } }))) }
-        dispatch({ type: 'set', chain: prev })
+        futureRef.current.push(currentEntry())
+        restoreEntry(prev)
         return true
     }, [])
 
     const redo = useCallback(() => {
         if (futureRef.current.length === 0) return false
         const next = futureRef.current.pop()
-        try { pastRef.current.push(structuredClone(stackRef.current.chain)) }
-        catch { pastRef.current.push(stackRef.current.chain.map((e) => ({ op: e.op, layer: { ...e.layer } }))) }
-        dispatch({ type: 'set', chain: next })
+        pastRef.current.push(currentEntry())
+        restoreEntry(next)
         return true
     }, [])
+
+    const setBase = useCallback((patch) => {
+        paramSnapshot()
+        dispatch({ type: 'setBase', base: patch })
+    }, [paramSnapshot])
 
     const canUndo = pastRef.current.length > 0
     const canRedo = futureRef.current.length > 0
@@ -347,6 +385,7 @@ export const useMaskLayers = () => {
         setGlobalInvert,
         selectedLayerId,
         selectLayer,
+        setBase,
         undo,
         redo,
         canUndo,
@@ -380,6 +419,15 @@ const reducer = (state, action) => {
             const op = chain.length === 0 ? 'replace' : 'add'
             chain.push({ layer, op })
             return { ...state, chain }
+        }
+        case 'restore':
+            // Undo/redo: replace chain AND base wholesale (no merge).
+            return reducer({ ...state, base: action.base ?? null }, { type: 'set', chain: action.chain })
+        case 'setBase': {
+            // Whole-image pre-grade (gamma/curves/wheels). null clears; a patch
+            // merges. Lives on the stack so filter sync + persistence ride free.
+            const base = action.base == null ? null : { ...(state.base || {}), ...action.base }
+            return { ...state, base }
         }
         case 'set': {
             // Wholesale replacement of the chain (undo/redo, hydrate from

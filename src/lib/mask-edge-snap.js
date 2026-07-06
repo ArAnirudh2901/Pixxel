@@ -26,8 +26,9 @@
 export const computeGradientMagnitude = (rgba, w, h) => {
     const n = Math.max(0, w * h)
     const lum = new Float32Array(n)
+    // `|| 0` guards a short rgba buffer (undefined reads → NaN in the map).
     for (let i = 0, p = 0; p < n; i += 4, p += 1) {
-        lum[p] = 0.2126 * rgba[i] + 0.7152 * rgba[i + 1] + 0.0722 * rgba[i + 2]
+        lum[p] = 0.2126 * (rgba[i] || 0) + 0.7152 * (rgba[i + 1] || 0) + 0.0722 * (rgba[i + 2] || 0)
     }
     const mag = new Float32Array(n)
     let max = 1e-6

@@ -15,7 +15,7 @@
  *
  * Models lazy-load on first use and are cached by the browser (HF hub files
  * land in the Cache API), so the download cost is paid once per device.
- * Trade-offs vs the local service: no SAM 2 edge refinement and no YOLO
+ * Trade-offs vs the local service: no SAM 3.1 edge refinement and no YOLO
  * instance detection — subject phrases fall back to text grounding, so
  * positional qualifiers ("second from the left") are not separable.
  *
@@ -39,9 +39,16 @@ const CHANGED_EVENT = 'phosmith:client-ai-changed'
 const GROUND_MODEL = 'Xenova/clipseg-rd64-refined'
 const DEPTH_MODEL = 'onnx-community/depth-anything-v2-small'
 // On-device click/box select — offline fallback when the SAM 3.1 service is
-// down. SlimSAM is tiny (~40 MB); the slow ViT encode is cached per image so
-// multi-click refine is fast.
-const SAM_MODEL = 'Xenova/slimsam-77-uniform'
+// down. Primary engine is the SAM 3 Tracker (the promptable point/box half of
+// SAM 3, ONNX export) — the closest browser match to the service's SAM 3.1.
+// Explicit dtype is mandatory: the default fp32 vision encoder is 1.9 GB
+// (q4f16 ≈ 300 MB on WebGPU, q8 ≈ 530 MB on WASM). SlimSAM (~40 MB) stays as
+// the sticky demotion fallback. The slow image encode is cached per image so
+// multi-click refine is fast on either engine.
+const SAM_ENGINES = [
+    { id: 'onnx-community/sam3-tracker-ONNX', kind: 'sam3', label: 'SAM 3 Tracker' },
+    { id: 'Xenova/slimsam-77-uniform', kind: 'sam1', label: 'SlimSAM' },
+]
 // Background removal / subject matting engines, in preference order. Chosen
 // empirically via verify:client-ai: BiRefNet-lite and MODNet's pipeline
 // graphs fail in this onnxruntime-web build (WASM: OrtRun std::bad_alloc
@@ -202,6 +209,39 @@ const withDeviceFallback = async (capability, run) => {
     }
 }
 
+/* ─── transformers.js import + ONNX runtime config ───────────────────────── */
+
+// Bundlers (Next/Turbopack included) break onnxruntime's runtime fetch of
+// ort-wasm-simd-threaded.jsep.{mjs,wasm} — the JSEP glue that defines
+// `webgpuInit` — so WebGPU init throws "webgpuInit is not a function" and WASM
+// reports "no available backend found", killing every in-browser model. Fix:
+// serve the version-matched dist files from /ort/ (scripts/setup-ort.mjs,
+// wired into dev/build) and point wasmPaths at them. Probed once so
+// environments without the files keep the bundler defaults.
+let ortEnvPromise = null
+const loadTransformers = async () => {
+    const tf = await import('@huggingface/transformers')
+    if (!ortEnvPromise) {
+        ortEnvPromise = (async () => {
+            if (!hasWindow()) return
+            try {
+                const base = new URL('/ort/', window.location.origin)
+                const probe = await fetch(new URL('ort-wasm-simd-threaded.jsep.mjs', base), { method: 'HEAD' })
+                if (probe.ok) {
+                    tf.env.backends.onnx.wasm.wasmPaths = base.href
+                    // No cross-origin isolation → no SharedArrayBuffer; pin
+                    // single-threaded WASM instead of letting ort probe.
+                    tf.env.backends.onnx.wasm.numThreads = 1
+                } else {
+                    console.warn('[client-ai] /ort/ runtime files missing (run: bun run setup:ort) — using bundler defaults')
+                }
+            } catch { /* keep bundler defaults */ }
+        })()
+    }
+    await ortEnvPromise
+    return tf
+}
+
 /* ─── Model singletons ───────────────────────────────────────────────────── */
 
 let groundPromise = null
@@ -257,7 +297,7 @@ const loadGroundModel = () => {
     if (groundPromise) return groundPromise
     groundPromise = (async () => {
         const { AutoTokenizer, AutoProcessor, CLIPSegForImageSegmentation } =
-            await import('@huggingface/transformers')
+            await loadTransformers()
         const device = await pickDevice()
         state.loading = 'CLIPSeg (text grounding)'
         emitState()
@@ -305,7 +345,7 @@ const loadGroundModel = () => {
 const loadDepthModel = () => {
     if (depthPromise) return depthPromise
     depthPromise = (async () => {
-        const { pipeline } = await import('@huggingface/transformers')
+        const { pipeline } = await loadTransformers()
         const device = await pickDevice()
         state.loading = 'Depth Anything V2'
         emitState()
@@ -334,7 +374,7 @@ let segmentEngineIndex = 0
 const loadSegmentModel = () => {
     if (segmentPromise) return segmentPromise
     segmentPromise = (async () => {
-        const transformers = await import('@huggingface/transformers')
+        const transformers = await loadTransformers()
         const device = await pickDevice()
         const engine = SEGMENT_ENGINES[Math.min(segmentEngineIndex, SEGMENT_ENGINES.length - 1)]
         state.loading = `${engine.id.split('/').pop()} (background removal)`
@@ -399,7 +439,10 @@ const CAPABILITY_LOADERS = {
     subjects: { load: loadGroundModel, pending: () => groundPromise != null, ready: () => state.groundReady },
     depth: { load: loadDepthModel, pending: () => depthPromise != null, ready: () => state.depthReady },
     segment: { load: loadSegmentModel, pending: () => segmentPromise != null, ready: () => state.segmentReady },
-    sam: { load: loadSamModel, pending: () => samPromise != null, ready: () => state.samReady },
+    // loadSamModel is declared further down — reading it eagerly here is a TDZ
+    // ReferenceError that crashes the whole module (and the editor) on import;
+    // the thunk defers the read to call time.
+    sam: { load: () => loadSamModel(), pending: () => samPromise != null, ready: () => state.samReady },
 }
 
 // Run during browser idle time so a multi-hundred-MB download + ONNX compile
@@ -489,7 +532,7 @@ const toInputCanvas = (el, naturalW, naturalH) => {
 }
 
 const canvasToRawImage = async (canvas) => {
-    const { RawImage } = await import('@huggingface/transformers')
+    const { RawImage } = await loadTransformers()
     const blob = await new Promise((res, rej) =>
         canvas.toBlob((b) => (b ? res(b) : rej(new Error('toBlob failed'))), 'image/png'))
     return RawImage.fromBlob(blob)
@@ -702,24 +745,39 @@ export const clientSubjectMask = async (el, dims) => {
 
 /* ─── On-device SAM (click / box select) ─────────────────────────────────── */
 
+// Index into SAM_ENGINES — bumped (sticky) when an engine fails so every
+// later call goes straight to the survivor (same pattern as SEGMENT_ENGINES).
+let samEngineIndex = 0
+
 const loadSamModel = () => {
     if (samPromise) return samPromise
     samPromise = (async () => {
-        const { SamModel, AutoProcessor } = await import('@huggingface/transformers')
+        const { SamModel, Sam3TrackerModel, AutoProcessor } = await loadTransformers()
         const device = await pickDevice()
-        state.loading = 'SlimSAM (click select)'
+        const engine = SAM_ENGINES[Math.min(samEngineIndex, SAM_ENGINES.length - 1)]
+        state.loading = `${engine.label} (click select)`
         emitState()
         try {
+            let loadModel
+            if (engine.kind === 'sam3') {
+                const dtype = device === 'webgpu'
+                    ? { vision_encoder: 'q4f16', prompt_encoder_mask_decoder: 'fp16' }
+                    : { vision_encoder: 'q8', prompt_encoder_mask_decoder: 'q8' }
+                loadModel = () => Sam3TrackerModel.from_pretrained(engine.id, { device, dtype })
+                    .catch(() => Sam3TrackerModel.from_pretrained(engine.id, {
+                        dtype: { vision_encoder: 'q8', prompt_encoder_mask_decoder: 'q8' },
+                    }))
+            } else {
+                loadModel = () => SamModel.from_pretrained(engine.id, { device })
+                    .catch(() => SamModel.from_pretrained(engine.id))
+            }
             const [model, processor] = await withTimeout(
-                Promise.all([
-                    SamModel.from_pretrained(SAM_MODEL, { device }).catch(() => SamModel.from_pretrained(SAM_MODEL)),
-                    AutoProcessor.from_pretrained(SAM_MODEL),
-                ]),
+                Promise.all([loadModel(), AutoProcessor.from_pretrained(engine.id)]),
                 LOAD_TIMEOUT_MS,
-                'SlimSAM model load',
+                `${engine.label} model load`,
             )
             state.samReady = true
-            return { model, processor }
+            return { model, processor, engine }
         } finally {
             state.loading = null
             emitState()
@@ -732,19 +790,19 @@ const loadSamModel = () => {
 // Encode the image ONCE (the slow ViT pass) and cache embeddings + the input
 // scale (natural → capped input coords) so every later click reuses them.
 const ensureSamImage = async (el, { width, height }) => {
-    const { model, processor } = await loadSamModel()
+    const { model, processor, engine } = await loadSamModel()
     const w0 = Number(width) || el?.naturalWidth || el?.width || 0
     const h0 = Number(height) || el?.naturalHeight || el?.height || 0
-    if (samImage && samImage.el === el && samImage.w === w0 && samImage.h === h0) {
-        return { model, processor, ...samImage }
+    if (samImage && samImage.el === el && samImage.w === w0 && samImage.h === h0 && samImage.engineId === engine.id) {
+        return { model, processor, engine, ...samImage }
     }
     const input = toInputCanvas(el, w0, h0) // capped to INPUT_MAX_SIDE
     const scale = input.width / w0          // natural → input coords
     const rawImage = await canvasToRawImage(input)
     let embeddings = null
     try { embeddings = await model.get_image_embeddings(await processor(rawImage)) } catch { embeddings = null }
-    samImage = { el, w: w0, h: h0, rawImage, embeddings, scale }
-    return { model, processor, ...samImage }
+    samImage = { el, w: w0, h: h0, rawImage, embeddings, scale, engineId: engine.id }
+    return { model, processor, engine, ...samImage }
 }
 
 // SAM output → coverage canvas at outW×outH (white = selected); picks the
@@ -786,23 +844,28 @@ const samMaskToCanvas = (maskTensor, iou, outW, outH) => {
 }
 
 const samClickOnce = async (el, points, labels, dims) => {
-    const { model, processor, rawImage, embeddings, scale } = await ensureSamImage(el, dims)
+    const { model, processor, engine, rawImage, embeddings, scale } = await ensureSamImage(el, dims)
     const input_points = [[points.map(([x, y]) => [Math.round(x * scale), Math.round(y * scale)])]]
     const input_labels = [[labels.map((l) => (l ? 1 : 0))]]
     const inputs = await processor(rawImage, { input_points, input_labels })
     let outputs
     if (embeddings) {
+        // The cached-embeddings call can RESOLVE with unusable outputs (no
+        // pred_masks) instead of throwing — validate, don't just catch, or the
+        // full-encode fallback below never runs and post-processing crashes.
         try {
             outputs = await model({ ...embeddings, input_points: inputs.input_points, input_labels: inputs.input_labels })
         } catch { outputs = null }
+        if (!outputs?.pred_masks) outputs = null
     }
-    if (!outputs) outputs = await withTimeout(model(inputs), INFER_TIMEOUT_MS, 'SlimSAM inference')
+    if (!outputs) outputs = await withTimeout(model(inputs), INFER_TIMEOUT_MS, `${engine.label} inference`)
     const masks = await processor.post_process_masks(outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes)
+    if (!masks?.[0]?.dims) throw new Error(`${engine.label} returned no mask for the point prompt`)
     return samMaskToCanvas(masks[0], outputs.iou_scores, dims.width, dims.height)
 }
 
 const samBoxOnce = async (el, box, dims) => {
-    const { model, processor, rawImage, embeddings, scale } = await ensureSamImage(el, dims)
+    const { model, processor, engine, rawImage, embeddings, scale } = await ensureSamImage(el, dims)
     const input_boxes = [[[
         Math.round(box[0] * scale), Math.round(box[1] * scale),
         Math.round(box[2] * scale), Math.round(box[3] * scale),
@@ -811,23 +874,44 @@ const samBoxOnce = async (el, box, dims) => {
     let outputs
     if (embeddings) {
         try { outputs = await model({ ...embeddings, input_boxes: inputs.input_boxes }) } catch { outputs = null }
+        if (!outputs?.pred_masks) outputs = null // resolved-but-unusable (see samClickOnce)
     }
-    if (!outputs) outputs = await withTimeout(model(inputs), INFER_TIMEOUT_MS, 'SlimSAM inference')
+    if (!outputs) outputs = await withTimeout(model(inputs), INFER_TIMEOUT_MS, `${engine.label} inference`)
     const masks = await processor.post_process_masks(outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes)
+    if (!masks?.[0]?.dims) throw new Error(`${engine.label} returned no mask for the box prompt`)
     return samMaskToCanvas(masks[0], outputs.iou_scores, dims.width, dims.height)
 }
 
+/** Sticky engine demotion for click/box select: when SAM 3 Tracker fails
+ *  (load OR inference), drop to SlimSAM and retry once — every later call
+ *  goes straight to the survivor. Mirrors segmentWithModelFallback. */
+const samWithEngineFallback = async (run) => {
+    try {
+        return await run()
+    } catch (err) {
+        if (samEngineIndex >= SAM_ENGINES.length - 1) throw err
+        console.warn(`[client-ai] ${SAM_ENGINES[samEngineIndex].id} failed (${err?.message}); demoting to ${SAM_ENGINES[samEngineIndex + 1].id}`)
+        samEngineIndex += 1
+        samPromise = null
+        samImage = null
+        state.samReady = false
+        emitState()
+        return run()
+    }
+}
+
 /**
- * In-browser SAM click-select (SlimSAM). `points` are [[x, y], ...] and
- * `labels` [1|0, ...] in the image's NATURAL pixel coords; returns a coverage
- * canvas at (width, height). Same timeout + WebGPU→WASM hardening as the rest.
+ * In-browser SAM click-select (SAM 3 Tracker → SlimSAM demotion). `points`
+ * are [[x, y], ...] and `labels` [1|0, ...] in the image's NATURAL pixel
+ * coords; returns a coverage canvas at (width, height). Same timeout +
+ * WebGPU→WASM hardening as the rest.
  */
 export const clientSamClick = (el, points, labels, dims) =>
-    withDeviceFallback('sam', () => samClickOnce(el, points, labels, dims))
+    withDeviceFallback('sam', () => samWithEngineFallback(() => samClickOnce(el, points, labels, dims)))
 
-/** In-browser SAM box-select (SlimSAM). `box` is [x0, y0, x1, y1] natural px. */
+/** In-browser SAM box-select. `box` is [x0, y0, x1, y1] natural px. */
 export const clientSamBox = (el, box, dims) =>
-    withDeviceFallback('sam', () => samBoxOnce(el, box, dims))
+    withDeviceFallback('sam', () => samWithEngineFallback(() => samBoxOnce(el, box, dims)))
 
 /* ─── Self-test ──────────────────────────────────────────────────────────── */
 
@@ -910,7 +994,28 @@ export const runClientAISelfTest = async ({ onProgress } = {}) => {
         progress(`Background removal failed: ${err?.message}`)
     }
 
-    const report = evaluateSelfTest({ ground, depth, segment }, disc)
+    progress('Loading SAM + click-selecting the disc…')
+    let sam = null
+    try {
+        const m = await clientSamClick(canvas, [[disc.cx, disc.cy]], [1], { width: disc.w, height: disc.h })
+        const ctx = m.getContext('2d', { willReadFrequently: true })
+        const px = ctx.getImageData(0, 0, m.width, m.height).data
+        const map = new Float32Array(m.width * m.height)
+        for (let i = 0, p = 0; i < px.length; i += 4, p += 1) map[p] = px[i] / 255
+        const stats = analyzeCoverage(map, m.width, m.height, 0.5)
+        sam = {
+            width: m.width,
+            height: m.height,
+            coverage: stats.coverage,
+            bbox: stats.bbox,
+            engine: SAM_ENGINES[Math.min(samEngineIndex, SAM_ENGINES.length - 1)].id,
+        }
+    } catch (err) {
+        sam = null
+        progress(`SAM click-select failed: ${err?.message}`)
+    }
+
+    const report = evaluateSelfTest({ ground, depth, segment, sam }, disc)
     return {
         ...report,
         device: state.device || 'unknown',
@@ -918,5 +1023,6 @@ export const runClientAISelfTest = async ({ onProgress } = {}) => {
         ground,
         depth,
         segment,
+        sam,
     }
 }

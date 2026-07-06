@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
     ArrowDown, ArrowDownLeft, ArrowDownRight, ArrowLeft, ArrowRight,
     ArrowUp, ArrowUpLeft, ArrowUpRight,
-    Blend, ChevronDown, ChevronRight, Circle, Contrast, Cpu, Crosshair, Eye, Layers,
+    Blend, ChevronDown, ChevronRight, Circle, Contrast, Cpu, Crosshair, Eye, EyeOff, Layers,
     Lasso, Loader2, Minus, Mountain, MousePointer, Palette, Paintbrush, Plus, RotateCcw, Scissors, Spline, Sparkles, Square, Sun, Wand2, X,
 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -14,14 +14,17 @@ import { useCanvas } from '../../../../../../../context/context'
 import usePixelMaskTool, { MIN_BRUSH, MAX_BRUSH } from '../../../../../../../hooks/usePixelMaskTool'
 import useMaskLayers from '../../../../../../../hooks/useMaskLayers'
 import { computeImageHistogram, getHistogramSourceElement } from '@/lib/image-histogram'
-import { rgbToHsb } from '@/lib/color-utils'
-import { setMaskTexture, rasterisePath, smoothToBezier } from '@/lib/megashader'
+import { rgbToHsb, hexToRgb, rgbToHsv, hsvToRgb } from '@/lib/color-utils'
+import { setMaskTexture, getMaskTexture, rasterisePath, smoothToBezier } from '@/lib/megashader'
+import { traceContour } from '@/lib/contour-trace'
 import { buildPackedLutFromCurves } from '@/lib/curve-lut'
-import { expandLayerBoundary } from '@/lib/mask-grow'
-import { AI_CAPABILITIES, getRoutingPolicy, resetRoutingPolicy, setRoutingMode, subscribeRouting, resolveOrder } from '@/lib/ai-routing'
-import { getClientAIState, runClientAISelfTest, subscribeClientAI, clientSamClick, clientSamBox, clientSubjectMask } from '@/lib/client-ai'
-import { serviceSubjectMask, serviceSamClick, serviceSamBox, bboxOfMaskCanvas } from '@/lib/mask-service-client'
+import { expandLayerBoundary, beginLayerRefine, applyRefineStroke } from '@/lib/mask-grow'
+import { AI_CAPABILITIES, getRoutingPolicy, getRoutingMode, resetRoutingPolicy, setRoutingMode, subscribeRouting, resolveOrder } from '@/lib/ai-routing'
+import { getClientAIState, runClientAISelfTest, subscribeClientAI, clientSamClick, clientSamBox, clientSubjectMask, clientGroundPhrase } from '@/lib/client-ai'
+import { serviceSubjectMask, serviceSamClick, serviceSamBox, serviceGroundText, bboxOfMaskCanvas, checkMaskService } from '@/lib/mask-service-client'
+import { cleanSubjectMatte } from '@/lib/subject-mask-cleanup'
 import { computeGradientMagnitude, snapToEdgePoint } from '@/lib/mask-edge-snap'
+import { pointToImageSpace, getImageBitmapSize } from '@/lib/canvas-mask'
 import {
     BrushSizeControl,
     LabeledSlider,
@@ -32,6 +35,7 @@ import {
     TipCard,
     ToolEmptyState,
 } from './_pixel-tool-ui'
+import LayerGradeEditor from './_layer-grade-editor'
 
 /* ─── collapsible section ─── */
 const Section = ({ title, icon: Icon, defaultOpen = false, children, badge }) => {
@@ -143,6 +147,52 @@ const isClosedBrushPath = (points, brushSize) => {
     )
 }
 
+// The megashader engine, the brush canvas, the layer geometry, and the SAM
+// upload dims all speak the source element's NATURAL pixels, but Fabric's
+// transform matrix (and pointToImageSpace) speak the object's logical
+// width/height. These are equal for a freshly loaded image, but diverge when
+// the object's width was set independently of its element (resize, re-encode,
+// a chain restored from JSON). These two helpers convert between the spaces and
+// are a strict no-op when the two sizes match, so they never touch the common
+// case — they only rescue the mismatch that otherwise makes every brush/click
+// land off-target while the marker overlay (same matrix) still tracks the cursor.
+const naturalVsObject = (img) => {
+    const el = img?._element || img?.getElement?.()
+    const natW = el?.naturalWidth || 0
+    const natH = el?.naturalHeight || 0
+    const bw = Math.max(1, Math.round(img?.width || natW || 1))
+    const bh = Math.max(1, Math.round(img?.height || natH || 1))
+    const differs = natW > 0 && natH > 0 && (natW !== bw || natH !== bh)
+    return { natW, natH, bw, bh, differs }
+}
+const toNaturalPx = (img, p) => {
+    if (!p) return p
+    const { natW, natH, bw, bh, differs } = naturalVsObject(img)
+    return differs ? { x: p.x * (natW / bw), y: p.y * (natH / bh) } : p
+}
+const toObjectPx = (img, p) => {
+    if (!p) return p
+    const { natW, natH, bw, bh, differs } = naturalVsObject(img)
+    return differs ? { x: p.x * (bw / natW), y: p.y * (bh / natH) } : p
+}
+
+// Kinds whose mask texture is luma-styled — safe for click-select refine
+// compositing (brush textures are alpha-styled; refine those with the brush).
+const REFINABLE_KINDS = ['semantic', 'lasso', 'path']
+
+// getMaskTexture may return ImageData — drawImage needs a canvas/image.
+const asDrawable = (t) => {
+    if (!t) return null
+    if (typeof ImageData !== 'undefined' && t instanceof ImageData) {
+        const c = document.createElement('canvas')
+        c.width = t.width
+        c.height = t.height
+        c.getContext('2d').putImageData(t, 0, 0)
+        return c
+    }
+    return t
+}
+
 const fillClosedBrushPath = (ctx, points, scale, brushSize) => {
     if (!ctx || !isClosedBrushPath(points, brushSize)) return false
     const s = Math.max(0.0001, scale || 1)
@@ -158,6 +208,21 @@ const fillClosedBrushPath = (ctx, points, scale, brushSize) => {
     ctx.fill('evenodd')
     ctx.restore()
     return true
+}
+
+// A fill/tint that CONTRASTS with the image's dominant hue, so a freshly
+// created selection's 'fill' output is visible instantly instead of blending
+// in (the old fixed-magenta default vanished on magenta/pink photos). Rotate
+// the dominant hue 180° and force a vivid, bright colour. Returns a 0-1 triple
+// (the megashader fillColor space). Cyan fallback if the hex can't be parsed.
+const contrastFillFromHex = (hex) => {
+    try {
+        const hsv = rgbToHsv(hexToRgb(hex))
+        const out = hsvToRgb((hsv.h + 180) % 360, Math.max(0.72, hsv.s), hsv.v < 0.55 ? 0.96 : 0.9)
+        return { r: out.r / 255, g: out.g / 255, b: out.b / 255 }
+    } catch {
+        return { r: 0, g: 0.85, b: 1 }
+    }
 }
 
 const MaskControls = ({ dominantColor }) => {
@@ -191,12 +256,12 @@ const MaskControls = ({ dominantColor }) => {
     const [activeInstanceIndex, setActiveInstanceIndex] = useState(/** @type {number | null} */ (null))
     const lastInstancesImageRef = useRef(/** @type {any} */ (null))
     // Id of the non-destructive megashader layer that currently holds the AI
-    // subject selection. The "Select Subject" / "Detect All Subjects" / chip
+    // subject selection. The "Select Subject" button (detect-all pass) / chip
     // picker all SELECT a region (they no longer erase the background); picking
     // a different subject SWAPS this single layer instead of stacking duplicates.
     const subjectLayerIdRef = useRef(/** @type {string | null} */ (null))
     // Ref-mirrors of the "running" flags. The `useCallback` closures for
-    // `handleSelectSubject` / `handleSemanticRun` / `handleDepthRun` capture
+    // `runSubjectSelection` / `handleSemanticRun` / `handleDepthRun` capture
     // the React state at render time, so a fast double-click (or two clicks
     // landing in the same batched render) could otherwise launch two
     // concurrent fetches and race to write the same state. The refs are
@@ -228,12 +293,24 @@ const MaskControls = ({ dominantColor }) => {
     // notes in hooks/useMaskLayers.js.
     const chain = useMaskLayers()
     const {
-        stack, addLayer: addChainLayer, removeLayer, updateLayer,
+        stack, addLayer: addChainLayerRaw, removeLayer, updateLayer,
         setLayerOp, setFillMode, moveLayer, clearAll,
         showMaskOverlay, setShowMaskOverlay, globalInvert, setGlobalInvert,
-        selectedLayerId, selectLayer,
+        selectedLayerId, selectLayer, setBase,
+        // (base grade rides on stack.base)
         undo: undoChain, redo: redoChain, canUndo, canRedo, setChain,
     } = chain
+
+    // Default new layers' fill tint to a colour that contrasts with the image,
+    // so a 'fill' selection is visible immediately (see contrastFillFromHex).
+    // Kept in a ref so the wrapped creator always reads the latest without
+    // re-binding every callback that creates a layer.
+    const autoFillColorRef = useRef(contrastFillFromHex(dominantColor))
+    useEffect(() => { autoFillColorRef.current = contrastFillFromHex(dominantColor) }, [dominantColor])
+    const addChainLayer = useCallback(
+        (kind, opts = {}) => addChainLayerRaw(kind, { fillColor: autoFillColorRef.current, ...opts }),
+        [addChainLayerRaw]
+    )
 
     // Always-current mirror of the chain so async callbacks (which capture the
     // `stack` from the render where they were created) can check the LIVE layer
@@ -249,6 +326,12 @@ const MaskControls = ({ dominantColor }) => {
     // (gamma + colour wheels are plain layer fields and flow through onUpdate).
     const applyCurve = useCallback((id, curves) => {
         const { packed, identity } = buildPackedLutFromCurves(curves || {})
+        if (id === 'base') {
+            if (identity) { setBase({ curveLutKey: null, curves: null }); return }
+            setMaskTexture('curve-base', new ImageData(new Uint8ClampedArray(packed), 256, 1))
+            setBase({ curveLutKey: 'curve-base', curves })
+            return
+        }
         if (identity) {
             updateLayer(id, { curveLutKey: undefined, curves: undefined })
             return
@@ -256,7 +339,37 @@ const MaskControls = ({ dominantColor }) => {
         const key = `curve-${id}`
         setMaskTexture(key, new ImageData(new Uint8ClampedArray(packed), 256, 1))
         updateLayer(id, { curveLutKey: key, curves })
-    }, [updateLayer])
+    }, [updateLayer, setBase])
+
+    // ⌘Z / ⌘⇧Z / Ctrl+Y — mask-tool-scoped (mounted only while the tool is
+    // active; same pattern as crop.jsx). Skipped while typing in inputs.
+    useEffect(() => {
+        const onKey = (e) => {
+            const t = e.target
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+            if (!(e.metaKey || e.ctrlKey)) return
+            if (e.key === 'z' || e.key === 'Z') {
+                e.preventDefault()
+                if (e.shiftKey) redoChain()
+                else undoChain()
+            } else if (e.key === 'y' || e.key === 'Y') {
+                e.preventDefault()
+                redoChain()
+            }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+    }, [undoChain, redoChain])
+
+    // Clean preview: hide gizmos + marching-ants to see the graded result.
+    const [cleanPreview, setCleanPreview] = useState(false)
+
+    const baseHasVisibleGrade = !!stack.base && (
+        (typeof stack.base.gamma === 'number' && Math.abs(stack.base.gamma - 1) > 1e-3)
+        || !!stack.base.curveLutKey
+        || [stack.base.wheelShadows, stack.base.wheelMidtones, stack.base.wheelHighlights]
+            .some((w) => Array.isArray(w) && w.some((n) => Number.isFinite(n) && n !== 0))
+    )
 
     // Persistence rehydrate: if the primary image already carries a persisted
     // MegashaderFilter (restored from project state by loadFromJSON, with its
@@ -271,9 +384,10 @@ const MaskControls = ({ dominantColor }) => {
         const persisted = mega?.stack?.chain
         if (Array.isArray(persisted) && persisted.length > 0 && stack.chain.length === 0) {
             setChain(persisted)
+            if (mega?.stack?.base) setBase(mega.stack.base)
             chainHydratedRef.current = true
         }
-    }, [tool.mainImage, stack.chain.length, setChain])
+    }, [tool.mainImage, stack.chain.length, setChain, setBase])
 
     // Per-capability AI routing policy (Auto / Device / Server). Initialised
     // to all-auto and synced from localStorage AFTER mount — reading the
@@ -302,6 +416,7 @@ const MaskControls = ({ dominantColor }) => {
         subjects: clientAI.groundReady,
         depth: clientAI.depthReady,
         segment: clientAI.segmentReady,
+        sam: clientAI.samReady,
     }
 
     // On-device AI self-test: runs the REAL in-browser models on a synthetic
@@ -334,6 +449,8 @@ const MaskControls = ({ dominantColor }) => {
     // radial) and the brush pointer-arbitration (handles must suppress the
     // pixel brush so clicking the image doesn't paint while editing a gradient).
     const selectedLayer = stack.chain.find((e) => e.layer.id === selectedLayerId)?.layer || null
+    const selectedLayerIdRef = useRef(selectedLayerId)
+    selectedLayerIdRef.current = selectedLayerId
     const selKind = selectedLayer?.kind
     const isGradientSelected = selKind === 'linear' || selKind === 'radial'
 
@@ -411,27 +528,70 @@ const MaskControls = ({ dominantColor }) => {
     // uImageSize` matches what the user pointed at).
     const pointerToImage = useCallback((fabricCanvas, e) => {
         if (!tool.mainImage || !fabricCanvas) return null
-        const pointer = fabricCanvas.getPointer(e.e || e)
-        const fabricObj = tool.mainImage
-        const objLeft = fabricObj.left || 0
-        const objTop = fabricObj.top || 0
-        const objScaleX = fabricObj.scaleX || 1
-        const objScaleY = fabricObj.scaleY || 1
-        return {
-            x: (pointer.x - objLeft) / objScaleX,
-            y: (pointer.y - objTop) / objScaleY,
+        // Fabric v7 removed Canvas#getPointer — the scene-space equivalent is
+        // getScenePoint. Keep the getPointer fallback for older Fabric (same
+        // compat shape as usePixelMaskTool.getScenePoint).
+        const evt = e.e || e
+        const pointer = typeof fabricCanvas.getScenePoint === 'function'
+            ? fabricCanvas.getScenePoint(evt)
+            : fabricCanvas.getPointer(evt)
+        // The main image is placed with originX/originY 'center', so its
+        // left/top is the CENTER — not the top-left corner. Invert the full
+        // transform matrix (the same math the brush tool uses via
+        // pointToImageSpace) so center-origin, rotation, and flip all map
+        // correctly to top-left-origin image pixels. A naïve
+        // (pointer - left) / scale here landed every click half an image
+        // off, so the bounds check rejected them as "outside the image".
+        const raw = pointToImageSpace(tool.mainImage, pointer)
+        if (!raw) return null
+        // `pointToImageSpace` works in the Fabric object's `width`/`height`
+        // units (getImageBitmapSize → img.width). But the megashader's
+        // uImageSize, the brush canvas, the layer geometry, and the SAM upload
+        // dims are ALL in the source element's NATURAL pixels. When a Fabric
+        // image's logical width diverges from the element's naturalWidth (a
+        // resized/re-encoded image, or a chain restored from JSON), the two
+        // spaces differ and every click/brush/box lands scaled-off — while the
+        // marker/overlay still round-trip to the cursor (imageToDisplay uses
+        // the same width), which is why the bug is "invisible until you drag".
+        // Convert to natural pixels here; a no-op when width === naturalWidth
+        // (the common case), so it can only correct the mismatch, never regress.
+        const pos = toNaturalPx(tool.mainImage, raw)
+        if (typeof window !== 'undefined' && window.__MASKDBG) {
+            const img = tool.mainImage
+            const el = img._element || img.getElement?.()
+            console.log('[maskdbg]', JSON.stringify({
+                pos: pos ? [Math.round(pos.x), Math.round(pos.y)] : null,
+                rawObjSpace: [Math.round(raw.x), Math.round(raw.y)],
+                imgWH: [img.width, img.height],
+                natWH: [el?.naturalWidth, el?.naturalHeight],
+                mismatch: img.width !== (el?.naturalWidth) || img.height !== (el?.naturalHeight),
+                scale: [img.scaleX, img.scaleY], zoom: fabricCanvas.getZoom?.(),
+            }))
         }
+        return pos
     }, [tool.mainImage])
 
     // Convert image-pixel coordinates to display-space (where Fabric
     // objects live). Used for drawing the live preview overlay so it
-    // sits exactly on top of the corresponding image pixel.
+    // sits exactly on top of the corresponding image pixel. This is the
+    // exact forward inverse of pointerToImage: shift the top-left-origin
+    // image pixel into the matrix's center-origin local space, then apply
+    // the object's transform matrix.
     const imageToDisplay = useCallback((imageX, imageY) => {
-        if (!tool.mainImage) return null
         const fabricObj = tool.mainImage
+        if (!fabricObj || typeof fabricObj.calcTransformMatrix !== 'function') return null
+        const m = fabricObj.calcTransformMatrix()
+        const { width, height } = getImageBitmapSize(fabricObj)
+        // imageX/imageY arrive in NATURAL pixels (see pointerToImage). The
+        // transform matrix operates in the object's width/height units, so map
+        // back before applying it — a no-op when natural === object size, which
+        // keeps the marker/overlay an exact inverse of pointerToImage.
+        const objP = toObjectPx(fabricObj, { x: imageX, y: imageY })
+        const lx = objP.x - width / 2
+        const ly = objP.y - height / 2
         return {
-            x: imageX * (fabricObj.scaleX || 1) + (fabricObj.left || 0),
-            y: imageY * (fabricObj.scaleY || 1) + (fabricObj.top || 0),
+            x: m[0] * lx + m[2] * ly + m[4],
+            y: m[1] * lx + m[3] * ly + m[5],
         }
     }, [tool.mainImage])
 
@@ -560,16 +720,16 @@ const MaskControls = ({ dominantColor }) => {
         return () => window.removeEventListener('keydown', onKey)
     }, [activeDraft])
 
-    /* ─── Semantic (SAM 2) click-to-select (Step 5) ─── */
+    /* ─── Semantic (SAM 3) click-to-select (Step 5) ─── */
 
     // Active click-mode flag — when true, mouse clicks on the canvas are
-    // captured as SAM 2 click points (positive by default, negative with
+    // captured as SAM 3 click points (positive by default, negative with
     // the Alt key held). Disabled while another tool (color picker,
     // spatial draft) is active so handlers don't fight over mouse:down.
     const [semanticActive, setSemanticActive] = useState(false)
     // List of `[x, y, label]` clicks in *original* (natural) image-pixel
     // coordinates. We accumulate here, then send the whole array to
-    // /api/ai/sam2 in one request when the user hits "Run".
+    // /api/ai/sam3 in one request when the user hits "Run".
     const [semanticClicks, setSemanticClicks] = useState(/** @type {Array<[number, number, 0 | 1]>} */ ([]))
     const [isSemanticRunning, setIsSemanticRunning] = useState(false)
     const isSemanticRunningRef = useRef(false)
@@ -585,7 +745,7 @@ const MaskControls = ({ dominantColor }) => {
     // so we can draw/erase them in lockstep with `semanticClicks`.
     const semanticMarkerRefs = useRef(/** @type {Array<any>} */ ([]))
 
-    // SAM 2 BOX prompt — the strongest single prompt for whole-object
+    // SAM 3 BOX prompt — the strongest single prompt for whole-object
     // selection. When armed, the next drag on the canvas defines the box
     // (in natural image-pixel coords, [x0, y0, x1, y1]); it can be combined
     // with clicks to refine. One box at a time — a new drag replaces it.
@@ -807,8 +967,26 @@ const MaskControls = ({ dominantColor }) => {
         }
     }, [])
 
+    // Sticky latch: server 501/404 (SAM not installed) is permanent for the
+    // session — skip server on later clicks instead of 429-storming the proxy.
+    // Explicit "Server" routing still forces a try; a server success clears it.
+    const serviceSamDownRef = useRef(false)
+    const serviceSamNoticeRef = useRef(false)
+
+    // Refine mode: composite each SAM result onto the SELECTED layer's mask
+    // (add = lighten, remove = inverted multiply) instead of staging a new one.
+    const [semanticRefine, setSemanticRefine] = useState(false)
+    const [semanticRefineMode, setSemanticRefineMode] = useState('add')
+    const semanticRefineRef = useRef(false)
+    semanticRefineRef.current = semanticRefine
+    const semanticRefineModeRef = useRef('add')
+    semanticRefineModeRef.current = semanticRefineMode
+    const refineTargetLayer = (selectedLayer && REFINABLE_KINDS.includes(selectedLayer.kind)
+        && selectedLayer.maskTextureKey) ? selectedLayer : null
+    useEffect(() => { if (!refineTargetLayer) setSemanticRefine(false) }, [refineTargetLayer])
+
     // Run SAM with the current click points and/or box. Routes through the
-    // masking service first (SAM 3.1) and falls back to on-device SlimSAM per
+    // masking service first (SAM 3.1) and falls back to on-device SAM 3 Tracker per
     // the 'sam' routing policy, so selection still works when the service is
     // down. Each call supersedes the previous (live per-interaction refine).
     const handleSemanticRun = useCallback(async () => {
@@ -841,19 +1019,67 @@ const MaskControls = ({ dominantColor }) => {
 
         let canvas = null
         let lastErr = null
+        const samMode = getRoutingMode('sam')
         for (const side of resolveOrder('sam')) {
+            if (side === 'server' && serviceSamDownRef.current && samMode !== 'server') continue
             try {
                 canvas = side === 'client' ? await runClient() : await runServer()
-                if (canvas) break
+                if (canvas) {
+                    if (side === 'server') serviceSamDownRef.current = false
+                    break
+                }
             } catch (err) {
                 if (err?.name === 'AbortError') return
                 lastErr = err
+                if (side === 'server' && (err?.status === 501 || err?.status === 404)) {
+                    serviceSamDownRef.current = true
+                    if (!serviceSamNoticeRef.current) {
+                        serviceSamNoticeRef.current = true
+                        toast('Server SAM 3.1 not installed — using on-device SAM 3', { icon: '📱' })
+                    }
+                }
             }
         }
         try {
             // A newer request superseded us while we were running — bail.
             if (semanticAbortRef.current !== abortController) return
             if (!canvas) throw lastErr || new Error('AI selection failed')
+            // Refine: composite straight onto the selected layer, re-base, done.
+            const targetId = semanticRefineRef.current ? selectedLayerIdRef.current : null
+            const target = targetId
+                ? chainStackRef.current?.chain?.find((e) => e.layer.id === targetId)?.layer
+                : null
+            if (target && REFINABLE_KINDS.includes(target.kind) && target.maskTextureKey) {
+                const cur = asDrawable(getMaskTexture(target.maskTextureKey))
+                const w = cur?.width || canvas.width
+                const h = cur?.height || canvas.height
+                const out = document.createElement('canvas')
+                out.width = w
+                out.height = h
+                const octx = out.getContext('2d')
+                if (cur) octx.drawImage(cur, 0, 0, w, h)
+                if (semanticRefineModeRef.current === 'remove') {
+                    const inv = document.createElement('canvas')
+                    inv.width = w
+                    inv.height = h
+                    const ictx = inv.getContext('2d')
+                    ictx.fillStyle = '#fff'
+                    ictx.fillRect(0, 0, w, h)
+                    ictx.globalCompositeOperation = 'difference'
+                    ictx.drawImage(canvas, 0, 0, w, h)
+                    octx.globalCompositeOperation = 'multiply'
+                    octx.drawImage(inv, 0, 0, w, h)
+                } else {
+                    octx.globalCompositeOperation = 'lighten'
+                    octx.drawImage(canvas, 0, 0, w, h)
+                }
+                const key = `${target.id}::c${Date.now().toString(36)}`
+                setMaskTexture(key, out)
+                updateLayer(target.id, { maskTextureKey: key, baseTextureKey: key, growPx: 0 })
+                setLastSemanticMask(null)
+                setLastSemanticPreview(null)
+                return
+            }
             const ctx = canvas.getContext('2d', { willReadFrequently: true })
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
             setLastSemanticMask(imageData)
@@ -868,7 +1094,7 @@ const MaskControls = ({ dominantColor }) => {
                 setIsSemanticRunning(false)
             }
         }
-    }, [tool, semanticClicks, semanticBox])
+    }, [tool, semanticClicks, semanticBox, updateLayer])
 
     // Live per-interaction selection: re-run SAM (debounced) whenever the click
     // points or box change, so each click/drag immediately updates the preview
@@ -892,7 +1118,7 @@ const MaskControls = ({ dominantColor }) => {
         }
         const key = `semantic-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
         setMaskTexture(key, lastSemanticMask)
-        const id = addChainLayer('semantic', { maskTextureKey: key, feather: 0.1, label: 'AI Subject' })
+        const id = addChainLayer('semantic', { maskTextureKey: key, baseTextureKey: key, growPx: 0, feather: 0.1, label: 'AI Subject' })
         if (id) toast.success('Semantic layer added to chain')
         // Clear the working state so the user knows the layer is now
         // managed by the chain (and so they don't accidentally add
@@ -905,7 +1131,7 @@ const MaskControls = ({ dominantColor }) => {
 
     /* ─── Depth (Depth Anything V2) (Step 6) ─── */
 
-    // Single-shot depth state. Unlike SAM 2 there's no click accumulation
+    // Single-shot depth state. Unlike SAM 3 there's no click accumulation
     // — the user hits "Generate" once, gets a whole-image depth map, and
     // can then add it to the chain with custom min/max/softness.
     const [isDepthRunning, setIsDepthRunning] = useState(false)
@@ -1115,6 +1341,17 @@ const MaskControls = ({ dominantColor }) => {
     const [brushModifier, setBrushModifier] = useState('new') // new|add|subtract|intersect
     const [brushEdgeSnap, setBrushEdgeSnap] = useState(false)
     const [brushFeather, setBrushFeather] = useState(0)       // image px, baked per region
+    // Brush-refine (ported from mask-studio): paint DIRECTLY on the selected
+    // layer's mask — each released stroke is composited into the texture via
+    // beginLayerRefine/applyRefineStroke (erase carves out, add unions in).
+    // Armed by the layer cards' "Erase region" / "Add region" buttons; Alt
+    // temporarily flips the stroke, like the studio.
+    const [refineTarget, setRefineTarget] = useState(/** @type {{layerId: string, mode: 'erase' | 'add'} | null} */ (null))
+    const refineSessionRef = useRef(/** @type {ReturnType<typeof beginLayerRefine> | null} */ (null))
+    const refineModeRef = useRef(/** @type {'erase' | 'add' | null} */ (null))
+    useEffect(() => { refineModeRef.current = refineTarget?.mode ?? null }, [refineTarget])
+    // Erase/add decided at stroke START (mode or Alt), fixed for the drag.
+    const strokeEraseRef = useRef(false)
 
     // Refs (so pointer handlers and effects read consistent values
     // without re-binding effects on every slider tweak).
@@ -1215,21 +1452,23 @@ const MaskControls = ({ dominantColor }) => {
     // inner disc relative to the full stamp radius — a soft brush
     // (hardness=0) is a pure radial gradient; a hard brush
     // (hardness=1) is a full opaque disc.
-    const stampBrush = useCallback((ctx, x, y, radius, hardness) => {
+    // `color` is an "r, g, b" string — refine erase strokes preview red; the
+    // stencil's ALPHA is what commits, so the tint is cosmetic.
+    const stampBrush = useCallback((ctx, x, y, radius, hardness, color = '255, 255, 255') => {
         if (!ctx || radius <= 0) return
         const h = Math.max(0, Math.min(1, hardness))
         if (h >= 0.999) {
             // Hard brush: single fill (faster, no gradient).
-            ctx.fillStyle = 'rgba(255, 255, 255, 1)'
+            ctx.fillStyle = `rgba(${color}, 1)`
             ctx.beginPath()
             ctx.arc(x, y, radius, 0, Math.PI * 2)
             ctx.fill()
             return
         }
         const grad = ctx.createRadialGradient(x, y, 0, x, y, radius)
-        grad.addColorStop(0, 'rgba(255, 255, 255, 1)')
-        grad.addColorStop(h, 'rgba(255, 255, 255, 1)')
-        grad.addColorStop(1, 'rgba(255, 255, 255, 0)')
+        grad.addColorStop(0, `rgba(${color}, 1)`)
+        grad.addColorStop(h, `rgba(${color}, 1)`)
+        grad.addColorStop(1, `rgba(${color}, 0)`)
         ctx.fillStyle = grad
         ctx.beginPath()
         ctx.arc(x, y, radius, 0, Math.PI * 2)
@@ -1239,21 +1478,21 @@ const MaskControls = ({ dominantColor }) => {
     // Interpolate stamps along a line from (x1, y1) → (x2, y2) so fast
     // drags don't show gaps. The step is `radius / 3` — three stamps
     // per diameter gives smooth coverage without overdraw.
-    const strokeBrush = useCallback((ctx, x1, y1, x2, y2, radius, hardness) => {
+    const strokeBrush = useCallback((ctx, x1, y1, x2, y2, radius, hardness, color) => {
         if (!ctx) return
         const dx = x2 - x1
         const dy = y2 - y1
         const dist = Math.sqrt(dx * dx + dy * dy)
         if (dist < 0.5) {
             // Sub-pixel drag — single stamp.
-            stampBrush(ctx, x2, y2, radius, hardness)
+            stampBrush(ctx, x2, y2, radius, hardness, color)
             return
         }
         const step = Math.max(1, radius / 3)
         const n = Math.max(1, Math.ceil(dist / step))
         for (let i = 1; i <= n; i += 1) {
             const t = i / n
-            stampBrush(ctx, x1 + dx * t, y1 + dy * t, radius, hardness)
+            stampBrush(ctx, x1 + dx * t, y1 + dy * t, radius, hardness, color)
         }
     }, [stampBrush])
 
@@ -1285,6 +1524,11 @@ const MaskControls = ({ dominantColor }) => {
         isPaintingRef.current = true
         lastBrushPointRef.current = { x: pos.x, y: pos.y }
         brushPointsRef.current = [{ x: pos.x, y: pos.y }]
+        // Refine mode: decide add vs erase at stroke START (Erase toggle or
+        // Alt-drag, studio-style) and hold it for the whole drag.
+        const evt = e?.e || e
+        strokeEraseRef.current = !!refineSessionRef.current
+            && (refineModeRef.current === 'erase' || !!evt?.altKey)
         // Step 10.1: scale the stamp position and radius into
         // brush-canvas space. `brushScale` is 1.0 for images already
         // at or below 2048 on the long edge, <1.0 for higher-res
@@ -1292,7 +1536,8 @@ const MaskControls = ({ dominantColor }) => {
         // units, so this is the only place the scaling happens.
         const s = brushScaleRef.current
         const r = Math.max(0.5, brushSizeRef.current / 2) * s
-        stampBrush(ctx, pos.x * s, pos.y * s, r, brushHardnessRef.current)
+        stampBrush(ctx, pos.x * s, pos.y * s, r, brushHardnessRef.current,
+            strokeEraseRef.current ? '248, 113, 113' : undefined)
         markBrushChanged()
         if (brushOverlayRef.current) {
             brushOverlayRef.current.set('dirty', true)
@@ -1324,7 +1569,8 @@ const MaskControls = ({ dominantColor }) => {
         // coordinates so the 2D context stamps the right pixels.
         const s = brushScaleRef.current
         const r = Math.max(0.5, brushSizeRef.current / 2) * s
-        strokeBrush(ctx, last.x * s, last.y * s, cx * s, cy * s, r, brushHardnessRef.current)
+        strokeBrush(ctx, last.x * s, last.y * s, cx * s, cy * s, r, brushHardnessRef.current,
+            strokeEraseRef.current ? '248, 113, 113' : undefined)
         lastBrushPointRef.current = { x: cx, y: cy }
         const pts = brushPointsRef.current
         const prev = pts[pts.length - 1]
@@ -1444,11 +1690,38 @@ const MaskControls = ({ dominantColor }) => {
                 }
             }
         }
+        // Refine mode: the released stroke lands on the layer's mask NOW
+        // (studio-style live refine) — no closed-shape fill, no Add step.
+        const session = refineSessionRef.current
+        if (session) {
+            isPaintingRef.current = false
+            lastBrushPointRef.current = null
+            brushPointsRef.current = []
+            const brushCanvas = brushCanvasRef.current
+            if (brushCanvas) {
+                try {
+                    applyRefineStroke(tool.mainImage, session, brushCanvas, { erase: strokeEraseRef.current })
+                } catch (err) {
+                    console.error('[mask] refine stroke failed:', err)
+                    toast.error(err?.message || 'Could not apply the stroke')
+                }
+                // Clear IN PLACE (the overlay uses this canvas as its element)
+                // so the next stroke starts from an empty stencil.
+                const bctx = brushCanvas.getContext('2d')
+                bctx?.clearRect(0, 0, brushCanvas.width, brushCanvas.height)
+                if (brushOverlayRef.current) {
+                    brushOverlayRef.current.set('dirty', true)
+                    canvasEditor?.requestRenderAll?.()
+                }
+            }
+            setBrushHasContent(false)
+            return
+        }
         fillClosedBrushStroke()
         isPaintingRef.current = false
         lastBrushPointRef.current = null
         brushPointsRef.current = []
-    }, [canvasEditor, imageSize, pointerToImage, fillClosedBrushStroke])
+    }, [canvasEditor, imageSize, pointerToImage, fillClosedBrushStroke, tool.mainImage])
 
     // Wire the pointer events when brush mode is active. Window-level
     // move + up so a drag that escapes the canvas still finalises.
@@ -1496,12 +1769,14 @@ const MaskControls = ({ dominantColor }) => {
         // The brush canvas is in image-pixel space; mirror the main
         // image's transform so the overlay sits exactly on top of the
         // corresponding image pixels.
+        // Scale includes the canvas→image factor (brush canvas is 2048-capped).
         const img = tool.mainImage
+        const { width: natW, height: natH } = getImageBitmapSize(img)
         const overlay = new FabricImage(brushCanvas, {
             left: img.left,
             top: img.top,
-            scaleX: img.scaleX,
-            scaleY: img.scaleY,
+            scaleX: img.scaleX * (natW / brushCanvas.width),
+            scaleY: img.scaleY * (natH / brushCanvas.height),
             angle: img.angle,
             originX: img.originX,
             originY: img.originY,
@@ -1558,11 +1833,13 @@ const MaskControls = ({ dominantColor }) => {
         const liveImg = tool.mainImage
         const fabricCanvas = canvasEditor
         if (!overlay || !liveImg || !fabricCanvas) return
+        // Same canvas→image scale factor as the create effect (2048 cap).
+        const { width: natW, height: natH } = getImageBitmapSize(liveImg)
         overlay.set({
             left: liveImg.left,
             top: liveImg.top,
-            scaleX: liveImg.scaleX,
-            scaleY: liveImg.scaleY,
+            scaleX: liveImg.scaleX * (natW / (overlay.width || 1)),
+            scaleY: liveImg.scaleY * (natH / (overlay.height || 1)),
             angle: liveImg.angle,
             originX: liveImg.originX,
             originY: liveImg.originY,
@@ -1581,10 +1858,13 @@ const MaskControls = ({ dominantColor }) => {
         panX, panY,
     ])
 
-    const handleStartBrush = useCallback(() => {
+    // Returns true when the brush actually armed (refine arming checks it).
+    // `opts.silent` skips the instruction toast; an onClick event arg is
+    // harmless (event.silent is undefined).
+    const handleStartBrush = useCallback((opts = {}) => {
         if (!imageSize) {
             toast.error('Image not ready yet')
-            return
+            return false
         }
         // Cancel any other click-mode (incl. Quick Erase) so its handler
         // doesn't fire and the destructive brush can't resume afterwards.
@@ -1594,7 +1874,7 @@ const MaskControls = ({ dominantColor }) => {
         setQuickEraseActive(false)
         if (activeDraft) {
             toast('Finish or cancel the current draft first', { icon: 'ℹ️' })
-            return
+            return false
         }
         ensureBrushCanvas()
         // Reset stale "hasContent" state from a prior session — without
@@ -1606,14 +1886,21 @@ const MaskControls = ({ dominantColor }) => {
         brushPointsRef.current = []
         shapeFillTokenRef.current += 1
         setIsShapeFilling(false)
+        refineSessionRef.current = null
+        setRefineTarget(null)
         setBrushActive(true)
-        toast(brushSink === 'erase'
-            ? 'Paint to mark the cut region, then "Add cut to layers". Nothing is erased until you add it.'
-            : 'Paint a selection, then "Add selection to layers". Non-destructive.')
+        if (!opts?.silent) {
+            toast(brushSink === 'erase'
+                ? 'Paint to mark the cut region, then "Add cut to layers". Nothing is erased until you add it.'
+                : 'Paint a selection, then "Add selection to layers". Non-destructive.')
+        }
+        return true
     }, [imageSize, ensureBrushCanvas, activeDraft, handleSemanticStop, brushSink])
 
     const handleStopBrush = useCallback(() => {
         setBrushActive(false)
+        refineSessionRef.current = null
+        setRefineTarget(null)
         isPaintingRef.current = false
         lastBrushPointRef.current = null
         brushPointsRef.current = []
@@ -1636,6 +1923,61 @@ const MaskControls = ({ dominantColor }) => {
             canvasEditor?.requestRenderAll?.()
         }
     }, [canvasEditor])
+
+    /* ─── Brush-refine (mask-studio port) ───────────────────────────────────
+     * Paint DIRECTLY on the selected layer's mask: drag adds coverage,
+     * Alt-drag (or the Erase toggle) removes it, and every RELEASED stroke is
+     * composited into the texture immediately via applyRefineStroke — no
+     * separate Apply step. beginLayerRefine swaps the texture in under a new
+     * key through the same direct-filter path as the Boundary slider.
+     */
+    const handleStopRefine = useCallback(() => {
+        refineSessionRef.current = null
+        setRefineTarget(null)
+        handleClearBrush()
+        setBrushActive(false)
+        isPaintingRef.current = false
+        lastBrushPointRef.current = null
+    }, [handleClearBrush])
+
+    // Arm the refine brush for a layer card's "Erase region" / "Add region".
+    const handleStartRefine = useCallback((layerId, mode) => {
+        const layer = chainStackRef.current?.chain?.find((e) => e.layer.id === layerId)?.layer
+        if (!layer?.maskTextureKey && !layer?.brushTextureKey) {
+            toast.error('This layer has no paintable mask region')
+            return
+        }
+        if (layer.lock) {
+            toast('Unlock the layer first', { icon: 'ℹ️' })
+            return
+        }
+        if (!handleStartBrush({ silent: true })) return
+        const brushCanvas = ensureBrushCanvas()
+        if (!brushCanvas) return
+        try {
+            refineSessionRef.current = beginLayerRefine(tool.mainImage, layerId, {
+                width: brushCanvas.width,
+                height: brushCanvas.height,
+            })
+        } catch (err) {
+            console.error('[mask] could not start refine:', err)
+            toast.error(err?.message || 'Could not start refining this layer')
+            setBrushActive(false)
+            return
+        }
+        selectLayer(layerId)
+        setRefineTarget({ layerId, mode })
+        toast(mode === 'erase'
+            ? 'Drag to ERASE from the mask · Alt-drag to add back · Done to finish'
+            : 'Drag to ADD to the mask · Alt-drag to erase · Done to finish')
+    }, [handleStartBrush, ensureBrushCanvas, selectLayer, tool.mainImage])
+
+    // Disarm if the target layer disappears (deleted / image swap).
+    useEffect(() => {
+        if (!refineTarget) return
+        const present = (stack.chain || []).some((e) => e.layer.id === refineTarget.layerId)
+        if (!present) handleStopRefine()
+    }, [refineTarget, stack.chain, handleStopRefine])
 
     // Commit the painted brush canvas as a NON-DESTRUCTIVE megashader
     // selection layer. The painted alpha is stored in the mask texture cache
@@ -1698,6 +2040,8 @@ const MaskControls = ({ dominantColor }) => {
         const id = brushEdgeSnap
             ? addChainLayer('smartBrush', {
                 brushTextureKey: key,
+                baseTextureKey: key,
+                growPx: 0,
                 filterRadius,
                 sigmaColor,
                 sigmaSpace,
@@ -1706,6 +2050,8 @@ const MaskControls = ({ dominantColor }) => {
             })
             : addChainLayer('brush', {
                 maskTextureKey: key,
+                baseTextureKey: key,
+                growPx: 0,
                 fillMode,
                 label: brushSink === 'erase' ? 'Brush cut' : 'Brush selection',
             })
@@ -1799,6 +2145,123 @@ const MaskControls = ({ dominantColor }) => {
         clearLassoOverlay()
         canvasEditor?.requestRenderAll?.()
     }, [clearLassoOverlay, canvasEditor])
+
+    // ── Marching-ants selection outline ─────────────────────────────────────
+    // A thin animated dashed line traced along the ACTIVE mask layer's boundary,
+    // so the user always sees exactly what's selected while adjusting it — even
+    // when the fill tint blends into a same-hue photo. Drawn as Fabric objects
+    // in scene space (via imageToDisplay), so it tracks zoom/pan automatically;
+    // flagged phosmithMaskOverlay so canvas history ignores it and exports drop
+    // it. Only texture-backed layers (AI subject/background, brush, lasso, depth)
+    // can be traced — procedural range masks have no coverage bitmap.
+    const outlineObjsRef = useRef([])
+    const outlineAntsRef = useRef(null)
+    const outlineRafRef = useRef(null)
+    const outlineDashRef = useRef(0)
+    // True whenever a pointer is pressed anywhere (brush/lasso stroke, slider
+    // drag). The ants animation skips its per-frame requestRenderAll while this
+    // is set, so it can never trigger a full-scene render mid brush-stroke (the
+    // in-stroke latency fast path in usePixelMaskTool/canvas.jsx must own that).
+    const pointerActiveRef = useRef(false)
+    useEffect(() => {
+        const down = () => { pointerActiveRef.current = true }
+        const up = () => { pointerActiveRef.current = false }
+        window.addEventListener('pointerdown', down, true)
+        window.addEventListener('pointerup', up, true)
+        window.addEventListener('pointercancel', up, true)
+        return () => {
+            window.removeEventListener('pointerdown', down, true)
+            window.removeEventListener('pointerup', up, true)
+            window.removeEventListener('pointercancel', up, true)
+        }
+    }, [])
+
+    const clearMaskOutline = useCallback(() => {
+        if (outlineRafRef.current) { cancelAnimationFrame(outlineRafRef.current); outlineRafRef.current = null }
+        const fc = canvasEditor
+        if (fc && outlineObjsRef.current.length) {
+            for (const o of outlineObjsRef.current) { try { fc.remove(o) } catch { /* canvas gone */ } }
+            fc.requestRenderAll?.()
+        }
+        outlineObjsRef.current = []
+        outlineAntsRef.current = null
+    }, [canvasEditor])
+
+    const drawMaskOutline = useCallback(() => {
+        const fc = canvasEditor
+        clearMaskOutline()
+        if (!fc || !tool.mainImage) return
+        const layer = chainStackRef.current?.chain?.find((e) => e.layer.id === selectedLayerIdRef.current)?.layer
+        const key = layer?.maskTextureKey
+        if (!key) return
+        // getMaskTexture may return ImageData OR a canvas/image/bitmap.
+        const srcData = getMaskTexture(key)
+        const srcW = srcData?.width || srcData?.naturalWidth || 0
+        const srcH = srcData?.height || srcData?.naturalHeight || 0
+        if (!srcW || !srcH) return
+        // Downscale for a fast trace (marching squares is O(pixels)); normalised
+        // coords are scale-invariant, so the outline still lands on the real edge.
+        let matte
+        try {
+            const cap = 512
+            const s = Math.min(1, cap / Math.max(srcW, srcH))
+            matte = document.createElement('canvas')
+            matte.width = Math.max(2, Math.round(srcW * s))
+            matte.height = Math.max(2, Math.round(srcH * s))
+            const mctx = matte.getContext('2d')
+            if (typeof ImageData !== 'undefined' && srcData instanceof ImageData) {
+                const full = document.createElement('canvas')
+                full.width = srcW
+                full.height = srcH
+                full.getContext('2d').putImageData(srcData, 0, 0)
+                mctx.drawImage(full, 0, 0, matte.width, matte.height)
+            } else {
+                mctx.drawImage(srcData, 0, 0, matte.width, matte.height)
+            }
+        } catch { return }
+        const poly = traceContour(matte, { threshold: 0.5, simplifyEpsilon: 0.004 })?.polygon
+        if (!poly || poly.length < 3) return
+        const imgW = tool.mainImage.width || srcData.width
+        const imgH = tool.mainImage.height || srcData.height
+        const pts = poly.map((p) => imageToDisplay(p.x * imgW, p.y * imgH)).filter(Boolean)
+        if (pts.length < 3) return
+        // Close the loop (Polyline renders open) so the boundary is a full ring.
+        const ring = [...pts, pts[0]]
+        const common = {
+            fill: 'transparent', selectable: false, evented: false,
+            excludeFromExport: true, objectCaching: false, strokeUniform: true,
+            phosmithMaskOverlay: true,
+        }
+        // Dark underlay (contrast on light photos) + white dashed ants on top.
+        const under = new Polyline(ring, { ...common, stroke: 'rgba(0,0,0,0.55)', strokeWidth: 2.5 })
+        const ants = new Polyline(ring, { ...common, stroke: '#ffffff', strokeWidth: 1.4, strokeDashArray: [5, 4], strokeDashOffset: outlineDashRef.current })
+        fc.add(under)
+        fc.add(ants)
+        outlineObjsRef.current = [under, ants]
+        outlineAntsRef.current = ants
+        fc.requestRenderAll()
+        // Animate the ants (~12fps). Pause while a brush/lasso stroke is live so
+        // we never fight the in-stroke latency fast path (see canvas.jsx notes).
+        let last = 0
+        const step = (t) => {
+            outlineRafRef.current = requestAnimationFrame(step)
+            if (t - last < 80) return
+            last = t
+            if (pointerActiveRef.current || isSegmentingRef.current || lassoDrawingRef.current) return
+            outlineDashRef.current = (outlineDashRef.current - 1) % 9
+            ants.set('strokeDashOffset', outlineDashRef.current)
+            fc.requestRenderAll()
+        }
+        outlineRafRef.current = requestAnimationFrame(step)
+    }, [canvasEditor, tool.mainImage, imageToDisplay, clearMaskOutline])
+
+    // (Re)draw the outline when the active layer, its coverage texture, or its
+    // grown boundary changes. Cleared on unmount / when nothing is selected.
+    useEffect(() => {
+        if (cleanPreview) { clearMaskOutline(); return undefined }
+        drawMaskOutline()
+        return () => clearMaskOutline()
+    }, [drawMaskOutline, clearMaskOutline, selectedLayerId, selectedLayer?.maskTextureKey, selectedLayer?.growPx, tool.mainImage, cleanPreview])
 
     // Rasterise the closed polygon to an offscreen alpha canvas (white
     // inside on opaque black, so Canvas2D anti-aliasing lands in the R
@@ -1919,6 +2382,8 @@ const MaskControls = ({ dominantColor }) => {
         setMaskTexture(key, canvas)
         const id = addChainLayer(usePen ? 'path' : 'lasso', {
             maskTextureKey: key,
+            baseTextureKey: key,
+            growPx: 0,
             feather: lassoFeather,
             fillMode: lassoSink === 'erase' ? 'erase' : 'fill',
             label: usePen
@@ -2164,14 +2629,12 @@ const MaskControls = ({ dominantColor }) => {
     /* ─── Re-editable gradient handles (linear / radial) ─── */
 
     // Point-based inverse of imageToDisplay — converts a scene/display point
-    // back to image-pixel space for handle drags.
+    // back to image-pixel space for handle drags. Uses the same centre-based
+    // transform inversion as pointerToImage (the image origin is 'center', so
+    // a plain (x - left) / scale would land handles half an image off).
     const displayToImage = useCallback((x, y) => {
-        const img = tool.mainImage
-        if (!img) return null
-        return {
-            x: (x - (img.left || 0)) / (img.scaleX || 1),
-            y: (y - (img.top || 0)) / (img.scaleY || 1),
-        }
+        if (!tool.mainImage) return null
+        return pointToImageSpace(tool.mainImage, { x, y })
     }, [tool.mainImage])
 
     // Latest selected layer, read inside drag handlers via a ref so the
@@ -2198,7 +2661,7 @@ const MaskControls = ({ dominantColor }) => {
         const fabricCanvas = canvasEditor
         clearGradientHandles()
         if (!fabricCanvas || !tool.mainImage) return undefined
-        if (!isGradientSelected || captureActive) return undefined
+        if (!isGradientSelected || captureActive || cleanPreview) return undefined
         const layer = selectedLayerRef.current
         if (!layer) return undefined
 
@@ -2232,11 +2695,17 @@ const MaskControls = ({ dominantColor }) => {
             let line = null
             let h1 = null
             let h2 = null
+            let hM = null
             const reflowLine = () => {
-                if (line && h1 && h2) {
-                    line.set({ x1: h1.left, y1: h1.top, x2: h2.left, y2: h2.top })
-                    line.setCoords?.()
-                }
+                const l = selectedLayerRef.current
+                if (!l?.p1 || !l?.p2) return
+                const d1 = imageToDisplay(l.p1.x, l.p1.y)
+                const d2 = imageToDisplay(l.p2.x, l.p2.y)
+                if (!d1 || !d2) return
+                if (h1) { h1.set({ left: d1.x, top: d1.y }); h1.setCoords?.() }
+                if (h2) { h2.set({ left: d2.x, top: d2.y }); h2.setCoords?.() }
+                if (hM) { hM.set({ left: (d1.x + d2.x) / 2, top: (d1.y + d2.y) / 2 }); hM.setCoords?.() }
+                if (line) { line.set({ x1: d1.x, y1: d1.y, x2: d2.x, y2: d2.y }); line.setCoords?.() }
             }
             if (p1d && p2d) {
                 line = new Line([p1d.x, p1d.y, p2d.x, p2d.y], {
@@ -2248,27 +2717,62 @@ const MaskControls = ({ dominantColor }) => {
             }
             h1 = makeHandle(layer.p1, (p) => { updateLayer(layer.id, { p1: { x: p.x, y: p.y } }); reflowLine() })
             h2 = makeHandle(layer.p2, (p) => { updateLayer(layer.id, { p2: { x: p.x, y: p.y } }); reflowLine() })
+            // Midpoint: drag both endpoints together (move the whole gradient).
+            hM = makeHandle(
+                { x: (layer.p1.x + layer.p2.x) / 2, y: (layer.p1.y + layer.p2.y) / 2 },
+                (p) => {
+                    const l = selectedLayerRef.current
+                    const mx = (l.p1.x + l.p2.x) / 2
+                    const my = (l.p1.y + l.p2.y) / 2
+                    const dx = p.x - mx
+                    const dy = p.y - my
+                    updateLayer(layer.id, {
+                        p1: { x: l.p1.x + dx, y: l.p1.y + dy },
+                        p2: { x: l.p2.x + dx, y: l.p2.y + dy },
+                    })
+                    reflowLine()
+                },
+            )
         } else if (layer.kind === 'radial' && layer.center && layer.radius) {
             let ell = null
             let cH = null
-            let rxH = null
-            let ryH = null
-            // Reposition the outline + all handles from the latest layer.
-            // For the handle being dragged this is a round-trip identity
-            // (its position defines the geometry), so it never fights the drag.
+            const edges = {}   // e/w/n/s resize handles
+            let rotH = null
+            const ROT_OFF = 26 / Math.max(0.0001, sy) // lollipop offset beyond N, ~const px
+            // Edge positions on the rotated axes (screen-y-down): E=+x, W=−x,
+            // S=+y, N=−y of the local frame.
+            const edgePos = (l, axis) => {
+                const rot = l.rotation || 0
+                const co = Math.cos(rot)
+                const si = Math.sin(rot)
+                const { x: cx, y: cy } = l.center
+                if (axis === 'e') return { x: cx + co * l.radius.x, y: cy + si * l.radius.x }
+                if (axis === 'w') return { x: cx - co * l.radius.x, y: cy - si * l.radius.x }
+                if (axis === 's') return { x: cx - si * l.radius.y, y: cy + co * l.radius.y }
+                if (axis === 'n') return { x: cx + si * l.radius.y, y: cy - co * l.radius.y }
+                // rot lollipop: beyond N
+                const ny = l.radius.y + ROT_OFF
+                return { x: cx + si * ny, y: cy - co * ny }
+            }
+            // Reposition outline + handles from the latest layer. For the
+            // dragged handle it's a round-trip identity, so it never fights.
             const reflow = () => {
                 const l = selectedLayerRef.current
                 if (!l || !l.center || !l.radius) return
                 const rot = l.rotation || 0
-                const co = Math.cos(rot)
-                const si = Math.sin(rot)
                 const cc = imageToDisplay(l.center.x, l.center.y)
                 if (ell && cc) { ell.set({ left: cc.x, top: cc.y, rx: Math.max(1, l.radius.x * sx), ry: Math.max(1, l.radius.y * sy), angle: rot * 180 / Math.PI }); ell.setCoords?.() }
                 if (cH && cc) { cH.set({ left: cc.x, top: cc.y }); cH.setCoords?.() }
-                const rp = imageToDisplay(l.center.x + co * l.radius.x, l.center.y + si * l.radius.x)
-                if (rxH && rp) { rxH.set({ left: rp.x, top: rp.y }); rxH.setCoords?.() }
-                const yp = imageToDisplay(l.center.x - si * l.radius.y, l.center.y + co * l.radius.y)
-                if (ryH && yp) { ryH.set({ left: yp.x, top: yp.y }); ryH.setCoords?.() }
+                for (const axis of ['e', 'w', 'n', 's']) {
+                    const h = edges[axis]
+                    if (!h) continue
+                    const d = imageToDisplay(edgePos(l, axis).x, edgePos(l, axis).y)
+                    if (d) { h.set({ left: d.x, top: d.y }); h.setCoords?.() }
+                }
+                if (rotH) {
+                    const d = imageToDisplay(edgePos(l, 'rot').x, edgePos(l, 'rot').y)
+                    if (d) { rotH.set({ left: d.x, top: d.y }); rotH.setCoords?.() }
+                }
             }
             const center = layer.center
             const radius = layer.radius
@@ -2286,28 +2790,36 @@ const MaskControls = ({ dominantColor }) => {
                 fabricCanvas.add(ell)
                 gradientHandlesRef.current.push(ell)
             }
-            const co0 = Math.cos(rotation)
-            const si0 = Math.sin(rotation)
             cH = makeHandle(center, (p) => {
                 updateLayer(layer.id, { center: { x: p.x, y: p.y } })
                 reflow()
             })
-            rxH = makeHandle({ x: center.x + co0 * radius.x, y: center.y + si0 * radius.x }, (p) => {
-                const l = selectedLayerRef.current
-                const dx = p.x - l.center.x
-                const dy = p.y - l.center.y
-                updateLayer(layer.id, { radius: { x: Math.max(2, Math.hypot(dx, dy)), y: l.radius.y }, rotation: Math.atan2(dy, dx) })
-                reflow()
-            })
-            ryH = makeHandle({ x: center.x - si0 * radius.y, y: center.y + co0 * radius.y }, (p) => {
+            // 4-way resize on the rotated axes — resize only, no rotation
+            // coupling (the lollipop owns rotation, studio-style).
+            const onResize = (axis) => (p) => {
                 const l = selectedLayerRef.current
                 const rot = l.rotation || 0
                 const dx = p.x - l.center.x
                 const dy = p.y - l.center.y
-                const newRy = Math.max(2, Math.abs(-Math.sin(rot) * dx + Math.cos(rot) * dy))
-                updateLayer(layer.id, { radius: { x: l.radius.x, y: newRy } })
+                const lx = dx * Math.cos(rot) + dy * Math.sin(rot)
+                const ly = -dx * Math.sin(rot) + dy * Math.cos(rot)
+                const radiusNext = (axis === 'e' || axis === 'w')
+                    ? { x: Math.max(2, Math.abs(lx)), y: l.radius.y }
+                    : { x: l.radius.x, y: Math.max(2, Math.abs(ly)) }
+                updateLayer(layer.id, { radius: radiusNext })
+                reflow()
+            }
+            for (const axis of ['e', 'w', 'n', 's']) {
+                edges[axis] = makeHandle(edgePos(layer, axis), onResize(axis))
+            }
+            // Rotate lollipop (green, above N): straight-up = 0.
+            rotH = makeHandle(edgePos(layer, 'rot'), (p) => {
+                const l = selectedLayerRef.current
+                const rot = Math.atan2(p.y - l.center.y, p.x - l.center.x) + Math.PI / 2
+                updateLayer(layer.id, { rotation: rot })
                 reflow()
             })
+            if (rotH) rotH.set({ fill: 'rgba(155,249,91,0.95)', radius: 6 })
         }
 
         // On drag end, snap the gizmo to the final geometry with a clean
@@ -2327,7 +2839,7 @@ const MaskControls = ({ dominantColor }) => {
         // Geometry is intentionally NOT a dependency (drag handlers reposition
         // imperatively); the image transform + handleTick drive rebuilds.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selectedLayerId, selKind, isGradientSelected, captureActive, canvasEditor, tool.mainImage,
+    }, [selectedLayerId, selKind, isGradientSelected, captureActive, cleanPreview, canvasEditor, tool.mainImage,
         imgLeft, imgTop, imgScaleX, imgScaleY, imgAngle, handleTick])
 
     // Live preview overlay: a thin dashed line/ellipse on the canvas
@@ -2402,7 +2914,7 @@ const MaskControls = ({ dominantColor }) => {
     // a NON-DESTRUCTIVE selection: it's stored in the megashader texture cache
     // and added as a `semantic` chain layer (fillMode 'fill' → the subject is
     // tinted/visible while the background is left fully intact). This is the
-    // same path SAM 2 / Lasso / Brush use, so the selection shows up in the
+    // same path SAM 3 / Lasso / Brush use, so the selection shows up in the
     // MASK LAYERS panel and stays editable (boundary, blend op, feather, and
     // add/subtract brush or lasso layers) "even after subject detection".
     //
@@ -2422,10 +2934,18 @@ const MaskControls = ({ dominantColor }) => {
             updateLayer(existingId, { maskTextureKey: key, baseTextureKey: key, growPx: 0, label: label || 'Subject' })
             return existingId
         }
-        const id = addChainLayer('semantic', { maskTextureKey: key, feather: 0.1, label: label || 'Subject' })
+        const id = addChainLayer('semantic', { maskTextureKey: key, baseTextureKey: key, growPx: 0, feather: 0.1, label: label || 'Subject' })
         subjectLayerIdRef.current = id
         return id
     }, [addChainLayer, updateLayer])
+
+    // Matte tuning for the ON-DEVICE subject path (cleanSubjectMatte).
+    const [subjectSensitivity, setSubjectSensitivity] = useState(50)
+    const [subjectFillHoles, setSubjectFillHoles] = useState(true)
+    const subjectSensitivityRef = useRef(50)
+    subjectSensitivityRef.current = subjectSensitivity
+    const subjectFillHolesRef = useRef(true)
+    subjectFillHolesRef.current = subjectFillHoles
 
     // Subject / Background selection. Routes through the masking service
     // (SAM 3.1, with a saliency→box-seed upgrade when the service returns a
@@ -2451,10 +2971,26 @@ const MaskControls = ({ dominantColor }) => {
         const dims = { width: origW, height: origH }
         try {
             let maskCanvas = null
+            let lastSideError = null
             for (const side of resolveOrder('segment')) {
                 try {
                     if (side === 'client') {
                         maskCanvas = await clientSubjectMask(sourceEl, dims)
+                        // Studio-parity matte cleanup: sensitivity → binarize
+                        // threshold, hole fill, luminance assist for backlit rims.
+                        try {
+                            const src = document.createElement('canvas')
+                            src.width = origW
+                            src.height = origH
+                            src.getContext('2d').drawImage(sourceEl, 0, 0, origW, origH)
+                            const cleaned = cleanSubjectMatte(maskCanvas, {
+                                threshold: Math.min(0.95, Math.max(0.05, 1 - subjectSensitivityRef.current / 100)),
+                                fillHoles: subjectFillHolesRef.current,
+                                luminanceAssist: true,
+                                sourceCanvas: src,
+                            })
+                            if (cleaned?.canvas) maskCanvas = cleaned.canvas
+                        } catch { /* raw matte */ }
                     } else {
                         const r = await serviceSubjectMask(sourceEl, { subjectBox: true, ...dims, signal: abortController.signal })
                         maskCanvas = r.canvas
@@ -2474,11 +3010,16 @@ const MaskControls = ({ dominantColor }) => {
                     if (maskCanvas) break
                 } catch (err) {
                     if (err?.name === 'AbortError') return
-                    /* try the next side */
+                    lastSideError = err
+                    console.warn(`[mask] ${side} subject selection failed:`, err?.message || err)
                 }
             }
             if (segmentAbortRef.current !== abortController) return
-            if (!maskCanvas) throw new Error(`${noun} detection failed`)
+            if (!maskCanvas) {
+                throw new Error(lastSideError?.message
+                    ? `${noun} detection failed — ${lastSideError.message}`
+                    : `${noun} detection failed`)
+            }
             const ctx = maskCanvas.getContext('2d', { willReadFrequently: true })
             const imageData = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)
             if (invert) {
@@ -2510,8 +3051,62 @@ const MaskControls = ({ dominantColor }) => {
         }
     }, [tool, applySubjectSelection])
 
-    const handleSelectSubject = useCallback(() => runSubjectSelection({ invert: false }), [runSubjectSelection])
     const handleSelectBackground = useCallback(() => runSubjectSelection({ invert: true }), [runSubjectSelection])
+
+    // Free-text NL masking: bg-ish phrases → inverted subject (grounding only
+    // binds the bright blob); else /ground/text with on-device CLIPSeg fallback.
+    const [conceptPhrase, setConceptPhrase] = useState('')
+    const [isGrounding, setIsGrounding] = useState(false)
+    const groundAbortRef = useRef(/** @type {AbortController | null} */ (null))
+    const runConcept = useCallback(async (rawPhrase) => {
+        const phrase = String(rawPhrase ?? conceptPhrase).trim()
+        if (!phrase || !tool.mainImage) return
+        if (/\b(background|backdrop|scenery|behind)\b/i.test(phrase)) {
+            runSubjectSelection({ invert: true, label: phrase })
+            return
+        }
+        const sourceEl = tool.mainImage._element || tool.mainImage.getElement?.()
+        if (!sourceEl) return
+        const origW = sourceEl.naturalWidth || sourceEl.width || 0
+        const origH = sourceEl.naturalHeight || sourceEl.height || 0
+        if (origW < 1 || origH < 1) return
+        try { groundAbortRef.current?.abort() } catch { /* ignore */ }
+        const abortController = new AbortController()
+        groundAbortRef.current = abortController
+        setIsGrounding(true)
+        const dims = { width: origW, height: origH }
+        try {
+            let canvas = null
+            let lastErr = null
+            for (const side of resolveOrder('ground')) {
+                try {
+                    canvas = side === 'client'
+                        ? await clientGroundPhrase(sourceEl, phrase, dims)
+                        : (await serviceGroundText(sourceEl, phrase, { ...dims, signal: abortController.signal })).canvas
+                    if (canvas) break
+                } catch (err) {
+                    if (err?.name === 'AbortError') return
+                    lastErr = err
+                }
+            }
+            if (groundAbortRef.current !== abortController) return
+            if (!canvas) throw lastErr || new Error(`No region matched "${phrase}"`)
+            const ctx = canvas.getContext('2d', { willReadFrequently: true })
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+            const key = `concept-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+            setMaskTexture(key, imageData)
+            const id = addChainLayer('semantic', { maskTextureKey: key, baseTextureKey: key, growPx: 0, feather: 0.1, label: phrase })
+            if (id) {
+                toast.success(`Masked "${phrase}" — refine it in Mask Layers`)
+                setConceptPhrase('')
+            }
+        } catch (err) {
+            if (err?.name === 'AbortError') return
+            toast.error(err?.message || `Could not mask "${phrase}"`)
+        } finally {
+            if (groundAbortRef.current === abortController) setIsGrounding(false)
+        }
+    }, [conceptPhrase, tool, runSubjectSelection, addChainLayer])
 
     /* ─── Multi-Subject Detection (Detect All Subjects) ──────────────────────
      * Calls /api/ai/segment-instances to enumerate every subject in the image
@@ -2566,8 +3161,11 @@ const MaskControls = ({ dominantColor }) => {
             if (instancesAbortRef.current !== abortController) return
 
             if (!data.instances?.length) {
-                toast.info('No distinct subjects detected — try Select Subject for the unified selection.')
+                // No distinct instances (a single blended subject, or YOLO found
+                // nothing) — fall back to the unified subject matte so the one
+                // button always produces a selection.
                 setSubjectInstances([])
+                await runSubjectSelection({ invert: false })
                 return
             }
             setSubjectInstances(data.instances)
@@ -2592,15 +3190,25 @@ const MaskControls = ({ dominantColor }) => {
             )
         } catch (err) {
             if (err?.name === 'AbortError') return
-            console.error('[mask] detect-all-subjects failed:', err)
-            toast.error(err?.message || 'Subject detection failed')
+            // The instance pass needs the masking service; when it's unreachable
+            // (fetch failed / 501) fall back to the unified subject matte, which
+            // has its own client (on-device) → server ordering and still selects
+            // offline. Only surface an error if that fallback also fails.
+            console.warn('[mask] detect-all-subjects failed, falling back to subject matte:', err?.message || err)
+            setSubjectInstances([])
+            try {
+                await runSubjectSelection({ invert: false })
+            } catch (fallbackErr) {
+                console.error('[mask] subject fallback failed:', fallbackErr)
+                toast.error(err?.message || 'Subject detection failed')
+            }
         } finally {
             if (instancesAbortRef.current === abortController) {
                 isDetectingInstancesRef.current = false
                 setIsDetectingInstances(false)
             }
         }
-    }, [tool, base64PngToBlob, decodeMaskBlob, applySubjectSelection])
+    }, [tool, base64PngToBlob, decodeMaskBlob, applySubjectSelection, runSubjectSelection])
 
     const handleApplyInstance = useCallback(async (instance) => {
         if (!tool.mainImage || !instance?.maskPng) return
@@ -2663,22 +3271,20 @@ const MaskControls = ({ dominantColor }) => {
         const fabricCanvas = canvasEditor
         if (!fabricCanvas) return
 
-        // Get the pixel color at click position from the canvas
-        const pointer = fabricCanvas.getPointer(e.e || e)
         const fabricObj = tool.mainImage
         const sourceEl = fabricObj?._element || fabricObj?.getElement?.()
         if (!sourceEl) return
 
-        // Transform pointer to image coordinates
+        // Transform pointer to image coordinates. Same centre-origin caveat as
+        // pointerToImage — reuse it so the eyedropper samples the pixel the
+        // user actually clicked (a naïve (pointer - left) / scale sampled the
+        // wrong pixel and rejected left/top-half clicks).
+        const pos = pointerToImage(fabricCanvas, e)
+        if (!pos) return
         const imgW = sourceEl.naturalWidth || sourceEl.width || fabricObj.width
         const imgH = sourceEl.naturalHeight || sourceEl.height || fabricObj.height
-        const objLeft = fabricObj.left || 0
-        const objTop = fabricObj.top || 0
-        const objScaleX = fabricObj.scaleX || 1
-        const objScaleY = fabricObj.scaleY || 1
-
-        const localX = (pointer.x - objLeft) / objScaleX
-        const localY = (pointer.y - objTop) / objScaleY
+        const localX = pos.x
+        const localY = pos.y
 
         if (localX < 0 || localY < 0 || localX >= imgW || localY >= imgH) return
 
@@ -2696,7 +3302,7 @@ const MaskControls = ({ dominantColor }) => {
 
         // Apply the color range mask
         tool.applyColorRangeMask({ ...color, tolerance: colorTolerance })
-    }, [colorPickerActive, tool, canvasEditor, colorTolerance])
+    }, [colorPickerActive, tool, canvasEditor, colorTolerance, pointerToImage])
 
     // Attach/detach canvas click listener for color picker
     React.useEffect(() => {
@@ -2810,6 +3416,62 @@ const MaskControls = ({ dominantColor }) => {
         )
     }
 
+    // Test hooks: scriptable surface for Playwright / console driving
+    // (window.__phosmith.mask, next to window.__phosmith.clientAI). Reinstalled
+    // every render so closures stay fresh; removed on unmount.
+    useEffect(() => {
+        if (typeof window === 'undefined') return undefined
+        const ns = (window.__phosmith = window.__phosmith || {})
+        ns.mask = {
+            ready: !!tool.mainImage && !!imageSize,
+            imageSize,
+            chain: stack.chain,
+            base: stack.base,
+            layer: (id) => stack.chain.find((e) => e.layer.id === (id ?? selectedLayerId))?.layer || null,
+            add: (kind, opts) => addChainLayer(kind, opts),
+            update: (id, patch) => updateLayer(id, patch),
+            remove: (id) => removeLayer(id),
+            move: (id, dir) => moveLayer(id, dir),
+            setOp: (id, op) => setLayerOp(id, op),
+            setFillMode: (id, mode) => setFillMode(id, mode),
+            select: (id) => selectLayer(id),
+            applyCurve: (id, curves) => applyCurve(id, curves),
+            setGamma: (id, gamma) => (id === 'base' ? setBase({ gamma }) : updateLayer(id, { gamma })),
+            setWheel: (id, key, offset) => (id === 'base' ? setBase({ [key]: offset }) : updateLayer(id, { [key]: offset })),
+            setBase: (patch) => setBase(patch),
+            undo: () => undoChain(),
+            redo: () => redoChain(),
+            expandBoundary: (id, px) => expandLayerBoundary(tool.mainImage, id, px),
+            refine: (on, mode) => { setSemanticRefine(!!on); if (mode) setSemanticRefineMode(mode) },
+            runSubject: () => runSubjectSelection({ invert: false }),
+            background: () => runSubjectSelection({ invert: true }),
+            runDepth: () => handleDepthRun(),
+            samBox: (x0, y0, x1, y1) => { setSemanticActive(true); setSemanticBox([x0, y0, x1, y1]) },
+            clickSelect: (x, y, label = 1) => {
+                setSemanticActive(true)
+                setSemanticClicks((prev) => [...prev, [x, y, label ? 1 : 0]])
+            },
+            runConcept: (phrase) => runConcept(phrase),
+            setSensitivity: (v) => setSubjectSensitivity(Number(v) <= 1 ? Math.round(Number(v) * 100) : Math.round(Number(v))),
+            setFillHoles: (v) => setSubjectFillHoles(!!v),
+            cleanPreview: (v) => setCleanPreview(!!v),
+            invert: (v) => setGlobalInvert(!!v),
+            aiState: () => getClientAIState(),
+            serviceStatus: () => checkMaskService(),
+            pixels: (x, y, w = 1, h = 1) => {
+                const el = tool.mainImage?._element || tool.mainImage?.getElement?.()
+                if (!el) return null
+                const c = document.createElement('canvas')
+                c.width = w
+                c.height = h
+                const ctx = c.getContext('2d', { willReadFrequently: true })
+                ctx.drawImage(el, x, y, w, h, 0, 0, w, h)
+                return Array.from(ctx.getImageData(0, 0, w, h).data)
+            },
+        }
+        return () => { delete ns.mask }
+    })
+
     if (!tool.mainImage) {
         return (
             <ToolEmptyState
@@ -2852,6 +3514,16 @@ const MaskControls = ({ dominantColor }) => {
                                 <Contrast className="h-3 w-3" />
                                 Invert
                             </button>
+                            <button
+                                type="button"
+                                onClick={() => setCleanPreview(!cleanPreview)}
+                                aria-pressed={cleanPreview}
+                                title="Hide handles and outlines to view the graded result"
+                                className={`mask-btn flex-1 text-[10px] py-1.5 ${cleanPreview ? 'mask-btn--primary' : ''}`}
+                            >
+                                <EyeOff className="h-3 w-3" />
+                                Clean view
+                            </button>
                         </div>
                     )}
                     {stack.chain.length > 0 && (
@@ -2877,6 +3549,45 @@ const MaskControls = ({ dominantColor }) => {
                             </button>
                         </div>
                     )}
+                    {/* Pinned Base grade — pre-grades the whole image (pass 1)
+                        so per-layer grades stack on top of it. */}
+                    <div
+                        className="rounded-lg p-2"
+                        style={{
+                            background: 'var(--bg-elevated)',
+                            border: `1px solid ${baseHasVisibleGrade ? 'rgba(155,249,91,0.35)' : 'var(--border-subtle)'}`,
+                        }}
+                    >
+                        <div className="flex items-center justify-between pb-1">
+                            <span className="text-[10px] font-semibold" style={{ color: baseHasVisibleGrade ? '#9bf95b' : 'var(--text-secondary)' }}>
+                                Base — whole image
+                            </span>
+                            {baseHasVisibleGrade && (
+                                <button
+                                    type="button"
+                                    onClick={() => setBase(null)}
+                                    className="text-[9px] editor-interactive"
+                                    style={{ color: 'var(--text-muted)' }}
+                                >
+                                    Reset
+                                </button>
+                            )}
+                        </div>
+                        <LayerGradeEditor
+                            layer={{
+                                id: 'base',
+                                gamma: 1,
+                                wheelShadows: [0, 0, 0],
+                                wheelMidtones: [0, 0, 0],
+                                wheelHighlights: [0, 0, 0],
+                                ...(stack.base || {}),
+                            }}
+                            onUpdate={(patch) => setBase(patch)}
+                            onApplyCurve={applyCurve}
+                            histogram={histogram}
+                            dominantColor={dominantColor}
+                        />
+                    </div>
                     <AnimatePresence>
                         {stack.chain.map((entry, i) => (
                             <MaskChainCard
@@ -2907,9 +3618,48 @@ const MaskControls = ({ dominantColor }) => {
                                         toast.error(err?.message || 'Could not adjust the mask boundary')
                                     }
                                 }}
+                                onRefineRegion={handleStartRefine}
                             />
                         ))}
                     </AnimatePresence>
+
+                    {/* Brush-refine bar (studio-style): strokes land on release;
+                        the toggle picks add vs erase, Alt flips per stroke. */}
+                    {refineTarget && (
+                        <div
+                            className="space-y-1.5 rounded-md p-2"
+                            style={{ border: '1px dashed rgba(124,58,237,0.45)', background: 'rgba(124,58,237,0.06)' }}
+                        >
+                            <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                                Refining the mask — drag to paint, each stroke applies on
+                                release. <strong>Alt-drag</strong> flips add/erase. Brush size
+                                &amp; hardness are under “Selection Brush”.
+                            </p>
+                            <div className="grid grid-cols-3 gap-1.5">
+                                <button
+                                    type="button"
+                                    onClick={() => setRefineTarget((t) => (t ? { ...t, mode: 'add' } : t))}
+                                    className={`mask-fill-mode-btn ${refineTarget.mode === 'add' ? 'mask-fill-mode-btn--active' : ''}`}
+                                >
+                                    Add
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setRefineTarget((t) => (t ? { ...t, mode: 'erase' } : t))}
+                                    className={`mask-fill-mode-btn ${refineTarget.mode === 'erase' ? 'mask-fill-mode-btn--active' : ''}`}
+                                >
+                                    Erase
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleStopRefine}
+                                    className="mask-btn mask-btn--primary text-[10px] py-1.5"
+                                >
+                                    Done
+                                </button>
+                            </div>
+                        </div>
+                    )}
 
                     {stack.chain.length === 0 && (
                         <p
@@ -3049,15 +3799,15 @@ const MaskControls = ({ dominantColor }) => {
             <Section title="Select Subject" icon={Sparkles} defaultOpen={true} badge="AI">
                 <motion.button
                     type="button"
-                    onClick={handleSelectSubject}
-                    disabled={isSegmenting}
+                    onClick={handleDetectAllSubjects}
+                    disabled={isSegmenting || isDetectingInstances}
                     whileTap={{ scale: 0.97 }}
                     className="mask-btn mask-btn--primary w-full py-2.5 text-xs font-semibold"
                 >
-                    {isSegmenting ? (
+                    {(isSegmenting || isDetectingInstances) ? (
                         <>
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            Detecting Subject…
+                            Detecting Subjects…
                         </>
                     ) : (
                         <>
@@ -3067,7 +3817,7 @@ const MaskControls = ({ dominantColor }) => {
                     )}
                 </motion.button>
                 <p className="text-[10px] text-center" style={{ color: 'var(--text-muted)' }}>
-                    AI selects the main subject as a layer — background stays intact
+                    AI detects every subject as a layer — pick one below or keep them all; background stays intact
                 </p>
 
                 {/* ── AI Background: subject mask, inverted ─────────────── */}
@@ -3099,32 +3849,67 @@ const MaskControls = ({ dominantColor }) => {
                     Everything except the subject — the reliable way to grade sky / backdrop
                 </p>
 
-                {/* ── Multi-subject: per-instance picker ────────────────── */}
-                <motion.button
-                    type="button"
-                    onClick={handleDetectAllSubjects}
-                    disabled={isDetectingInstances}
-                    whileTap={{ scale: 0.97 }}
-                    className="mask-btn w-full py-2 text-[11px] font-semibold"
-                    style={{
-                        background: 'rgba(124,58,237,0.10)',
-                        border: '1px solid rgba(124,58,237,0.30)',
-                        color: '#C4B5FD',
-                    }}
-                >
-                    {isDetectingInstances ? (
-                        <>
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            Detecting all subjects…
-                        </>
-                    ) : (
-                        <>
-                            <Sparkles className="h-3.5 w-3.5" />
-                            Detect All Subjects
-                        </>
-                    )}
-                </motion.button>
+                {/* ── NL phrase → mask (grounding) ─────────────────────── */}
+                <div className="flex items-center gap-1.5">
+                    <input
+                        type="text"
+                        value={conceptPhrase}
+                        onChange={(e) => setConceptPhrase(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') runConcept() }}
+                        placeholder='Describe a region — e.g. "the sky"'
+                        disabled={isGrounding}
+                        className="flex-1 rounded-lg px-2 py-1.5 text-[11px] editor-interactive"
+                        style={{
+                            background: 'var(--bg-elevated)',
+                            border: '1px solid var(--border-subtle)',
+                            color: 'var(--text-primary)',
+                        }}
+                    />
+                    <motion.button
+                        type="button"
+                        onClick={() => runConcept()}
+                        disabled={isGrounding || !conceptPhrase.trim()}
+                        whileTap={{ scale: 0.97 }}
+                        className="rounded-lg px-2.5 py-1.5 text-[11px] font-semibold editor-interactive disabled:opacity-40"
+                        style={{
+                            background: 'rgba(124,58,237,0.18)',
+                            border: '1px solid rgba(124,58,237,0.45)',
+                            color: '#C4B5FD',
+                        }}
+                    >
+                        {isGrounding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Mask it'}
+                    </motion.button>
+                </div>
 
+                {/* ── On-device matte tuning (used on the Device fallback) ── */}
+                <LabeledSlider
+                    label="Sensitivity"
+                    value={subjectSensitivity}
+                    min={0}
+                    max={100}
+                    suffix="%"
+                    onChange={setSubjectSensitivity}
+                    dominantColor={dominantColor}
+                />
+                <button
+                    type="button"
+                    onClick={() => setSubjectFillHoles((v) => !v)}
+                    className="flex items-center gap-1.5 text-[10px] editor-interactive"
+                    style={{ color: subjectFillHoles ? 'var(--accent-primary)' : 'var(--text-muted)' }}
+                >
+                    <span
+                        className="inline-block h-3 w-3 rounded-sm"
+                        style={{
+                            background: subjectFillHoles ? 'rgba(6,184,212,0.85)' : 'transparent',
+                            border: '1px solid ' + (subjectFillHoles ? 'rgba(6,184,212,0.85)' : 'var(--border-subtle)'),
+                        }}
+                    />
+                    Fill enclosed holes (on-device matte)
+                </button>
+
+                {/* ── Multi-subject: per-instance picker ──────────────────
+                    Populated by the primary Select Subject button, which runs
+                    the detect-all-subjects pass. */}
                 {subjectInstances && subjectInstances.length > 0 && (
                     <div className="space-y-1.5">
                         <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
@@ -3167,11 +3952,11 @@ const MaskControls = ({ dominantColor }) => {
                 )}
             </Section>
 
-            {/* ────────── Click-to-Select (SAM 2) ────────── */}
+            {/* ────────── Click-to-Select (SAM 3) ────────── */}
             <Section title="Click to Select" icon={MousePointer} badge="AI">
                 <div className="space-y-2">
                     <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
-                        Click to mark the subject — or draw a box around it — then run SAM 2. Hold{' '}
+                        Click to mark the subject — or draw a box around it — then run SAM 3. Hold{' '}
                         <kbd className="px-1 rounded text-[9px]" style={{ background: 'var(--bg-elevated)' }}>Alt</kbd>{' '}
                         to mark background (negative click).
                     </p>
@@ -3233,7 +4018,7 @@ const MaskControls = ({ dominantColor }) => {
                         </motion.button>
                     </div>
 
-                    {/* Box prompt — SAM 2's strongest single prompt for whole
+                    {/* Box prompt — SAM 3's strongest single prompt for whole
                         objects. One box at a time; a new drag replaces it. */}
                     {semanticActive && (
                         <div className="flex items-center gap-1.5">
@@ -3247,7 +4032,7 @@ const MaskControls = ({ dominantColor }) => {
                                     border: `1px solid ${boxArmed ? 'rgba(6,184,212,0.45)' : 'var(--border-subtle)'}`,
                                     color: boxArmed ? 'var(--accent-primary)' : 'var(--text-secondary)',
                                 }}
-                                title="Drag a rectangle around the object — SAM 2 selects what's inside"
+                                title="Drag a rectangle around the object — SAM 3 selects what's inside"
                             >
                                 <Square className="h-3 w-3" />
                                 {boxArmed ? 'Drag on the image…' : semanticBox ? 'Redraw box' : 'Draw box'}
@@ -3268,6 +4053,48 @@ const MaskControls = ({ dominantColor }) => {
                                     <X className="h-2.5 w-2.5" />
                                 </button>
                             )}
+                        </div>
+                    )}
+
+                    {/* Refine: composite results onto the SELECTED mask layer. */}
+                    {semanticActive && refineTargetLayer && (
+                        <div className="flex items-center gap-1.5">
+                            <motion.button
+                                type="button"
+                                onClick={() => setSemanticRefine((v) => !v)}
+                                whileTap={{ scale: 0.97 }}
+                                className="flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] font-medium editor-interactive truncate"
+                                style={{
+                                    background: semanticRefine ? 'rgba(155,249,91,0.14)' : 'var(--bg-elevated)',
+                                    border: `1px solid ${semanticRefine ? 'rgba(155,249,91,0.40)' : 'var(--border-subtle)'}`,
+                                    color: semanticRefine ? '#9bf95b' : 'var(--text-secondary)',
+                                }}
+                                title="Clicks refine the selected mask instead of staging a new layer"
+                            >
+                                <Wand2 className="h-3 w-3" />
+                                {semanticRefine ? 'Refining' : 'Refine'} “{refineTargetLayer.label || refineTargetLayer.kind}”
+                            </motion.button>
+                            {semanticRefine && ['add', 'remove'].map((m) => (
+                                <button
+                                    key={m}
+                                    type="button"
+                                    onClick={() => setSemanticRefineMode(m)}
+                                    className="text-[9px] px-2 py-1.5 rounded capitalize"
+                                    style={{
+                                        background: semanticRefineMode === m
+                                            ? (m === 'add' ? 'rgba(6,184,212,0.18)' : 'rgba(239,68,68,0.18)')
+                                            : 'var(--bg-elevated)',
+                                        color: semanticRefineMode === m
+                                            ? (m === 'add' ? 'var(--accent-primary)' : '#FCA5A5')
+                                            : 'var(--text-secondary)',
+                                        border: `1px solid ${semanticRefineMode === m
+                                            ? (m === 'add' ? 'rgba(6,184,212,0.45)' : 'rgba(239,68,68,0.40)')
+                                            : 'var(--border-subtle)'}`,
+                                    }}
+                                >
+                                    {m}
+                                </button>
+                            ))}
                         </div>
                     )}
 
@@ -3312,7 +4139,9 @@ const MaskControls = ({ dominantColor }) => {
                         {isSemanticRunning ? (
                             <>
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                Running SAM 2…
+                                {serviceSamDownRef.current && !clientAI.samReady
+                                    ? 'Downloading SAM 3 model…'
+                                    : 'Running SAM 3…'}
                             </>
                         ) : (
                             <>
@@ -3331,7 +4160,7 @@ const MaskControls = ({ dominantColor }) => {
                             <div className="flex items-center gap-2">
                                 <img
                                     src={lastSemanticPreview}
-                                    alt="SAM 2 mask preview"
+                                    alt="SAM 3 mask preview"
                                     className="rounded"
                                     style={{ width: 64, height: 64, objectFit: 'contain', background: '#000' }}
                                 />
@@ -3570,7 +4399,7 @@ const MaskControls = ({ dominantColor }) => {
                     <motion.button
                         type="button"
                         onClick={handleAddBrushLayer}
-                        disabled={!brushHasContent || isShapeFilling}
+                        disabled={!brushHasContent || isShapeFilling || !!refineTarget}
                         whileTap={{ scale: 0.97 }}
                         className="flex w-full items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold editor-interactive disabled:opacity-40"
                         style={{
@@ -3582,9 +4411,11 @@ const MaskControls = ({ dominantColor }) => {
                         {isShapeFilling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
                         {isShapeFilling
                             ? 'Filling shape...'
-                            : brushSink === 'erase'
-                                ? 'Add cut to layers'
-                                : 'Add selection to layers'}
+                            : refineTarget
+                                ? 'Refining layer — strokes apply on release'
+                                : brushSink === 'erase'
+                                    ? 'Add cut to layers'
+                                    : 'Add selection to layers'}
                     </motion.button>
                 </div>
             </Section>
@@ -4224,7 +5055,7 @@ const MaskControls = ({ dominantColor }) => {
             </div>
 
             <TipCard>
-                <p><strong>AI Tools</strong> — Select Subject (one-click), Click to Select (SAM 2), and Depth Range use AI models to generate masks automatically.</p>
+                <p><strong>AI Tools</strong> — Select Subject (one-click), Click to Select (SAM 3), and Depth Range use AI models to generate masks automatically.</p>
                 <p><strong>Draw Selection</strong> — Selection Brush paints a region; Lasso draws freehand, polygonal, or edge-snapping (magnetic) outlines.</p>
                 <p><strong>Range Selection</strong> — Color, Luminance, and Gradient masks select by pixel properties. Combine multiple methods into one mask.</p>
                 <p>Each selection becomes its own <strong>Mask Layer</strong> with per-layer feather, blend mode, and fill / adjust / erase output.</p>

@@ -82,7 +82,7 @@ export const AI_CAPABILITIES = {
         hint: 'Point or drag to select an object',
         client: true,
         server: true,
-        clientImpl: 'SlimSAM in browser',
+        clientImpl: 'SAM 3 Tracker in browser',
         serverImpl: 'SAM 3.1 (service)',
     },
     inpaint: {

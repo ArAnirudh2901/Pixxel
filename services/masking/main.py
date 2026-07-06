@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover - optional accel
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from PIL import Image, ImageFilter, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
 from rembg import new_session, remove
 from starlette.concurrency import run_in_threadpool
 
@@ -120,9 +120,13 @@ GROUND_MAX_SIDE = int(os.getenv("GROUND_MAX_SIDE", "2048").strip())
 GROUND_MAX_PHRASES = int(os.getenv("GROUND_MAX_PHRASES", "4").strip())
 
 # rembg model registry. isnet-*/u2net*/silueta = MIT; bria-rmbg = CC BY-NC.
+# birefnet-* need rembg >= 2.0.57 (this env: 2.0.75); birefnet-general is the
+# quality pick for backlit/complex mattes (~930 MB first download).
 ALLOWED_MODELS = {
     "isnet-general-use", "u2net", "u2netp", "u2net_human_seg",
     "u2net_cloth_seg", "silueta", "bria-rmbg",
+    "birefnet-general", "birefnet-general-lite", "birefnet-portrait",
+    "birefnet-dis", "birefnet-hrsod", "birefnet-massive",
 }
 if MODEL_NAME not in ALLOWED_MODELS:
     log.warning("unknown SEGMENT_MODEL=%r; falling back to isnet-general-use", MODEL_NAME)
@@ -132,21 +136,48 @@ if MODEL_NAME not in ALLOWED_MODELS:
 # ─── Execution providers / torch device ─────────────────────────────────────
 
 def detect_providers() -> List[str]:
-    """Best ONNX providers: CUDA > CoreML (Apple) > CPU."""
+    """ONNX providers for the rembg session: CUDA when present, else CPU.
+
+    CoreML is deliberately NOT preferred on Apple Silicon. This process also
+    loads the torch/MPS models (SAM 3, Depth Anything), and the rembg CoreML
+    session intermittently HARD-FAILS at inference under that Neural-Engine
+    contention — ONNXRuntime error -1, "Unable to compute the prediction using a
+    neural network model" — which 500s /segment/instances (the editor's Select
+    Subject saliency-seed path). CoreML is also ~6× slower than CPU for
+    isnet-general-use here (≈30s vs ≈5s). Opt back in explicitly with
+    SEGMENT_PROVIDERS=CoreMLExecutionProvider,CPUExecutionProvider."""
     override = os.getenv("SEGMENT_PROVIDERS", "").strip()
     if override:
         return [p.strip() for p in override.split(",") if p.strip()]
     providers: List[str] = ["CPUExecutionProvider"]
     try:
         import onnxruntime as ort  # type: ignore
-        available = set(ort.get_available_providers())
-        if "CUDAExecutionProvider" in available:
+        if "CUDAExecutionProvider" in set(ort.get_available_providers()):
             providers.insert(0, "CUDAExecutionProvider")
-        elif "CoreMLExecutionProvider" in available:
-            providers.insert(0, "CoreMLExecutionProvider")
     except Exception as e:  # pragma: no cover
         log.debug("onnxruntime provider probe failed: %s", e)
     return providers
+
+
+def _rembg_matte(img: "Image.Image") -> "Image.Image":
+    """rembg saliency matte (single-channel 'L'), self-healing to a CPU session.
+
+    If the active ONNX provider fails at inference (e.g. a CoreML session
+    configured via SEGMENT_PROVIDERS dying under MPS contention), rebuild the
+    session on CPU once and retry rather than 500-ing the request. CPU is the
+    default provider, so on a healthy box this is a plain passthrough."""
+    try:
+        return remove(img, session=app.state.session, only_mask=True)
+    except Exception as e:
+        if app.state.providers == ["CPUExecutionProvider"]:
+            raise
+        log.warning(
+            "rembg inference failed on %s (%s); rebuilding session on CPU",
+            app.state.providers, e,
+        )
+        app.state.session = new_session(app.state.model_name, providers=["CPUExecutionProvider"])
+        app.state.providers = ["CPUExecutionProvider"]
+        return remove(img, session=app.state.session, only_mask=True)
 
 
 def detect_torch_device():
@@ -970,8 +1001,17 @@ def _decode_image(contents: bytes, *, max_side: int, rgb_only: bool = False) -> 
     try:
         img = Image.open(io.BytesIO(contents))
         img.load()
+        # Camera JPEGs store the rotation in EXIF; every model here works on the
+        # raw pixels, so without this the mask comes back rotated relative to
+        # what any EXIF-aware viewer (or the browser) shows. No-op without EXIF.
+        img = ImageOps.exif_transpose(img)
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as e:
         raise HTTPException(400, f"could not decode image: {e}")
+    if img.mode in ("I", "I;16", "I;16B", "I;16L", "I;16N"):
+        # 16/32-bit greyscale: PIL's convert("RGB") truncates instead of
+        # rescaling, which blacks the frame out and every model sees nothing.
+        arr = np.asarray(img, dtype=np.float32)
+        img = Image.fromarray(np.clip(arr / 257.0, 0, 255).astype(np.uint8), "L")
     if rgb_only:
         if img.mode != "RGB":
             img = img.convert("RGB")
@@ -1047,33 +1087,68 @@ async def segment(image: UploadFile = File(..., alias="image")) -> Response:
     subject_mode = "sam3"
     subjects = 0
     final_alpha = None
+    matte = None  # cleaned saliency matte, computed at most once
+
+    async def _saliency_matte():
+        nonlocal matte
+        if matte is None:
+            try:
+                matte_img = await run_in_threadpool(_rembg_matte, img)
+            except Exception as e:
+                log.exception("rembg.remove failed")
+                raise HTTPException(500, f"segmentation failed: {e}")
+            raw_matte = np.asarray(matte_img.convert("L"), dtype=np.uint8)
+            matte = await run_in_threadpool(clean_matte, raw_matte)
+        return matte
 
     if await run_in_threadpool(_ensure_sam3, app):
-        try:
-            instances = await run_in_threadpool(
-                _sam3_instances_for_prompt, app, img_rgb, SAM3_SUBJECT_PROMPT
-            )
-        except Exception:
-            log.exception("SAM 3 subject segmentation failed; using saliency fallback")
-            instances = []
-        if instances:
-            subjects = len(instances)
-            union_bin = _union_from_instances(instances, img.width, img.height) > 0
-            final_alpha = _soft_alpha_from_mask(union_bin)
-            if SAM3_REFINE_MATTING:
-                final_alpha = await run_in_threadpool(
-                    _refine_alpha_with_matting, final_alpha, np_rgb, union_bin
+        if SAM3_SUBJECT_PROMPT == "main subject":
+            # SAM 3's open-vocab detector cannot ground the abstract default
+            # prompt — a concept pass always comes back empty after a full
+            # detection sweep (~50 s/image on CPU). Take the same saliency-bbox
+            # → SAM 3 box-prompt path as /segment/instances' subject_box mode:
+            # one cheap rembg pass seeds SAM 3's strongest single-object prompt.
+            try:
+                m8 = await _saliency_matte()
+                bbox = _bbox_from_mask(m8 > 127)
+                if bbox is not None:
+                    bx, by, bw, bh = bbox
+                    m, _score = await run_in_threadpool(
+                        _sam3_box_mask, app, img_rgb, (bx, by, bx + bw, by + bh)
+                    )
+                    mb = m > 127
+                    if mb.any():
+                        subjects = 1
+                        final_alpha = _soft_alpha_from_mask(mb)
+                        if SAM3_REFINE_MATTING:
+                            final_alpha = await run_in_threadpool(
+                                _refine_alpha_with_matting, final_alpha, np_rgb, mb
+                            )
+            except HTTPException:
+                raise
+            except Exception:
+                log.exception("SAM 3 box-seed subject failed; using saliency fallback")
+        else:
+            # A deployment-specific CONCRETE prompt — the concept pass is real.
+            try:
+                instances = await run_in_threadpool(
+                    _sam3_instances_for_prompt, app, img_rgb, SAM3_SUBJECT_PROMPT
                 )
+            except Exception:
+                log.exception("SAM 3 subject segmentation failed; using saliency fallback")
+                instances = []
+            if instances:
+                subjects = len(instances)
+                union_bin = _union_from_instances(instances, img.width, img.height) > 0
+                final_alpha = _soft_alpha_from_mask(union_bin)
+                if SAM3_REFINE_MATTING:
+                    final_alpha = await run_in_threadpool(
+                        _refine_alpha_with_matting, final_alpha, np_rgb, union_bin
+                    )
 
     if final_alpha is None:
         subject_mode = "saliency"
-        try:
-            matte_img = await run_in_threadpool(remove, img, session=app.state.session, only_mask=True)
-        except Exception as e:
-            log.exception("rembg.remove failed")
-            raise HTTPException(500, f"segmentation failed: {e}")
-        raw_matte = np.asarray(matte_img.convert("L"), dtype=np.uint8)
-        final_alpha = await run_in_threadpool(clean_matte, raw_matte)
+        final_alpha = await _saliency_matte()
         subjects = 1 if final_alpha.any() else 0
 
     rgba = np.dstack([np_rgb, final_alpha]).astype(np.uint8)
@@ -1118,7 +1193,7 @@ async def segment_instances(
 
     if subject_box:
         try:
-            matte_img = await run_in_threadpool(remove, img, session=app.state.session, only_mask=True)
+            matte_img = await run_in_threadpool(_rembg_matte, img)
         except Exception as e:
             log.exception("rembg.remove failed")
             raise HTTPException(500, f"segmentation failed: {e}")
@@ -1155,7 +1230,7 @@ async def segment_instances(
             mode = "saliency"
             source_model = app.state.model_name
             try:
-                matte_img = await run_in_threadpool(remove, img, session=app.state.session, only_mask=True)
+                matte_img = await run_in_threadpool(_rembg_matte, img)
             except Exception as e:
                 log.exception("rembg.remove failed")
                 raise HTTPException(500, f"segmentation failed: {e}")

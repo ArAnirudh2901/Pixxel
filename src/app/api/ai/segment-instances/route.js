@@ -19,7 +19,7 @@ export const runtime = 'nodejs'
  *
  * No HuggingFace fallback: per-instance segmentation requires the local
  * YOLO-seg + BiRefNet stack. Without MASKING_SERVICE_URL this returns 501,
- * matching /api/ai/sam2 and /api/ai/depth.
+ * matching /api/ai/sam3 and /api/ai/depth.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const MASKING_SERVICE_URL = (process.env.MASKING_SERVICE_URL || process.env.MASK_SERVICE_URL)?.trim().replace(/\/+$/, '') || ''

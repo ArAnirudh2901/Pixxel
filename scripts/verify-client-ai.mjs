@@ -62,6 +62,25 @@ await writeFile(
   path.join(HARNESS_DIR, 'index.html'),
   '<!doctype html><meta charset="utf-8"><title>client-ai harness</title><script type="module" src="./entry.js"></script>',
 )
+// Serve the version-matched ORT runtime from /ort/ exactly like the Next app
+// (public/ort via scripts/setup-ort.mjs) — client-ai.js probes this path and
+// pins wasmPaths to it, which is what fixes the "webgpuInit is not a
+// function" / "no available backend found" bundler failure.
+{
+  const { copyFileSync, readdirSync } = await import('node:fs')
+  const ortSrc = [
+    path.join(ROOT, 'node_modules/@huggingface/transformers/node_modules/onnxruntime-web/dist'),
+    path.join(ROOT, 'node_modules/onnxruntime-web/dist'),
+  ].find((d) => existsSync(d))
+  if (ortSrc) {
+    await mkdir(path.join(HARNESS_DIR, 'ort'), { recursive: true })
+    for (const f of readdirSync(ortSrc)) {
+      if (/^ort-wasm-simd-threaded.*\.(mjs|wasm)$/.test(f)) {
+        copyFileSync(path.join(ortSrc, f), path.join(HARNESS_DIR, 'ort', f))
+      }
+    }
+  }
+}
 log('harness bundled')
 
 /* ─── 3. Static server ──────────────────────────────────────────────────── */

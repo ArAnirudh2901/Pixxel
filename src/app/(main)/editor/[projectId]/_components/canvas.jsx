@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react"
 import { useCanvas } from "../../../../../../context/context"
 import { useDatabaseMutation } from "../../../../../../hooks/useDatabaseQuery"
 import { api } from "@/lib/neon-api";
-import { Hand, Maximize2, ZoomIn, ZoomOut } from "lucide-react"
+import { Hand, Maximize2, ZoomIn, ZoomOut, ArrowLeftRight } from "lucide-react"
 import {
     Canvas,
     FabricImage,
@@ -154,6 +154,11 @@ const CanvasEditor = ({ project }) => {
     const [previewZoomPercent, setPreviewZoomPercent] = useState(100)
     const projectFrameStyleRef = useRef({ left: 0, top: 0, width: 0, height: 0 })
     const [projectFrameStyle, setProjectFrameStyle] = useState({ left: 0, top: 0, width: 0, height: 0 })
+    // Before/After compare: a per-tool "session baseline" — the flattened image
+    // captured when the current tool was opened. Held-down Compare overlays it on
+    // the live canvas so the user sees before (baseline) vs after (current edits).
+    const [compareBaselineUrl, setCompareBaselineUrl] = useState(null)
+    const [isComparing, setIsComparing] = useState(false)
     const lastPointerRef = useRef(null)
     const historyRef = useRef([])
     const historyIndexRef = useRef(-1)
@@ -1312,14 +1317,26 @@ const CanvasEditor = ({ project }) => {
             // Lazy-load the megashader module so the production editor bundle
             // never pulls in the GLSL compiler unless the dev test panel
             // (or a Step 2+ tool) actually subscribes.
-            import('@/lib/megashader').then((mod) => {
-                mod.applyMegashaderFilter(image, stack, {
-                    globalMaskAlpha: megashaderAlphaRef.current,
-                    globalInvert: megashaderInvertRef.current,
-                    maskOverlay: megashaderOverlayRef.current,
+            import('@/lib/megashader')
+                .then((mod) => {
+                    // Split the dynamic-import failure (module genuinely absent
+                    // in a non-test build — safe to ignore) from a failure
+                    // INSIDE applyMegashaderFilter. The latter used to be
+                    // swallowed here, which silently hid a real render bug (the
+                    // MegashaderFilter constructor threw on every call, so no
+                    // mask layer ever rendered). Surface apply errors loudly.
+                    try {
+                        mod.applyMegashaderFilter(image, stack, {
+                            globalMaskAlpha: megashaderAlphaRef.current,
+                            globalInvert: megashaderInvertRef.current,
+                            maskOverlay: megashaderOverlayRef.current,
+                        })
+                        canvasInstanceRef.current?.requestRenderAll?.()
+                    } catch (err) {
+                        console.error('[megashader] applyMegashaderFilter failed:', err)
+                    }
                 })
-                canvasInstanceRef.current?.requestRenderAll?.()
-            }).catch(() => { /* noop — module not available in non-test paths */ })
+                .catch(() => { /* noop — module not available in non-test paths */ })
         }
 
         // Step 10.2: debounced entry point. Cancels any pending
@@ -1723,7 +1740,13 @@ const CanvasEditor = ({ project }) => {
                 // toggles, or window resizes.
                 fitProjectToViewport(canvas)
                 canvas.calcOffset()
-                canvas.requestRenderAll()
+                // Render SYNCHRONOUSLY (not requestRenderAll) here: setDimensions
+                // above resets the <canvas> element size, which clears its bitmap.
+                // requestRenderAll would repaint on the NEXT frame, leaving one
+                // blank frame per resize step — visible as flicker while the user
+                // drags the sidebar resizer. renderAll repaints in the same frame,
+                // so the clear is never shown.
+                canvas.renderAll()
 
                 // Sync the project frame overlay and the zoom percentage HUD
                 if (typeof canvas.__syncProjectFrame === 'function') {
@@ -1756,6 +1779,84 @@ const CanvasEditor = ({ project }) => {
         canvas.calcOffset()
         canvas.requestRenderAll()
     }, [fitProjectToViewport, project?._id, project?.width, project?.height])
+
+    // Capture the current on-screen project frame as the compare baseline. We
+    // grab the region straight from Fabric's already-composited lower canvas
+    // (the "after" pixels the user sees) rather than re-rendering — so capture
+    // never disturbs the live canvas and the baseline aligns 1:1 with the
+    // projectFrameStyle rect used to position the overlay. Selection handles /
+    // brush previews live on the upper canvas, so the lower canvas is clean.
+    const captureCompareBaseline = useCallback(() => {
+        const canvas = canvasInstanceRef.current
+        const frame = projectFrameStyleRef.current
+        if (!canvas || !frame?.width || !frame?.height) {
+            setCompareBaselineUrl(null)
+            return
+        }
+        try {
+            const el = canvas.getElement?.() || canvas.lowerCanvasEl
+            if (!el?.width) { setCompareBaselineUrl(null); return }
+            // Backing store may be devicePixelRatio-scaled vs the CSS width Fabric
+            // reports; map screen-space frame rect into backing-store pixels.
+            const scale = el.width / (canvas.getWidth() || el.width)
+            const sx = Math.max(0, Math.round(frame.left * scale))
+            const sy = Math.max(0, Math.round(frame.top * scale))
+            const sw = Math.min(el.width - sx, Math.round(frame.width * scale))
+            const sh = Math.min(el.height - sy, Math.round(frame.height * scale))
+            if (sw < 1 || sh < 1) { setCompareBaselineUrl(null); return }
+            const off = document.createElement("canvas")
+            off.width = sw
+            off.height = sh
+            off.getContext("2d").drawImage(el, sx, sy, sw, sh, 0, 0, sw, sh)
+            setCompareBaselineUrl(off.toDataURL("image/png"))
+        } catch (err) {
+            // Tainted canvas (non-CORS image) or disposed canvas — disable compare.
+            console.warn("[canvas] compare baseline capture failed:", err?.message || err)
+            setCompareBaselineUrl(null)
+        }
+    }, [])
+
+    // Re-capture the session baseline whenever the active tool changes (or the
+    // canvas first finishes loading). "Before" = the state the current tool
+    // inherited; "After" = whatever the user does next. Deferred to the next
+    // frame so any pending render/fit has settled and projectFrameStyleRef is
+    // current. Leaving compare mode on tool switch avoids a stale overlay.
+    useEffect(() => {
+        setIsComparing(false)
+        if (!canvasEditor || isLoading) return undefined
+        const raf = requestAnimationFrame(() => captureCompareBaseline())
+        return () => cancelAnimationFrame(raf)
+    }, [activeTool, canvasEditor, isLoading, captureCompareBaseline])
+
+    // Safety net: releasing the pointer anywhere ends a hold-to-compare, even if
+    // the pointerup lands outside the button.
+    useEffect(() => {
+        if (!isComparing) return undefined
+        const end = () => setIsComparing(false)
+        window.addEventListener("pointerup", end)
+        window.addEventListener("pointercancel", end)
+        return () => {
+            window.removeEventListener("pointerup", end)
+            window.removeEventListener("pointercancel", end)
+        }
+    }, [isComparing])
+
+    const canCompare = Boolean(compareBaselineUrl) && !isBusy && isProjectFrameVisible
+    const startCompare = useCallback((event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        // Capture the pointer so holding then sliding off the button keeps the
+        // before-view up until release (no premature flip on a small jiggle).
+        try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* ignore */ }
+        setIsComparing(true)
+    }, [])
+    const endCompare = useCallback(() => setIsComparing(false), [])
+    const handleCompareKeyDown = useCallback((event) => {
+        if (event.key === " " || event.key === "Enter") {
+            event.preventDefault()
+            setIsComparing(true)
+        }
+    }, [])
 
     const previewSliderValue = clamp(previewZoomPercent, MIN_PREVIEW_ZOOM_PERCENT, MAX_PREVIEW_ZOOM_PERCENT)
     const canAdjustPreview = Boolean(canvasEditor)
@@ -1798,6 +1899,26 @@ const CanvasEditor = ({ project }) => {
                 <canvas id='canvas' className='rounded-xl editor-canvas-surface' ref={canvasRef} />
             </div>
 
+            {/* Before/After compare overlay — the session baseline stretched over
+                the live canvas's project frame. Shown only while Compare is held. */}
+            {isComparing && compareBaselineUrl && isProjectFrameVisible && (
+                <>
+                    <img
+                        src={compareBaselineUrl}
+                        alt=""
+                        aria-hidden="true"
+                        className="editor-canvas-compare-overlay pointer-events-none absolute"
+                        style={{
+                            left: `${projectFrameStyle.left}px`,
+                            top: `${projectFrameStyle.top}px`,
+                            width: `${projectFrameStyle.width}px`,
+                            height: `${projectFrameStyle.height}px`,
+                        }}
+                    />
+                    <div className="editor-canvas-compare-pill" role="status" aria-live="polite">Before</div>
+                </>
+            )}
+
             {!isBusy && (
                 <button
                     type="button"
@@ -1829,6 +1950,23 @@ const CanvasEditor = ({ project }) => {
                         height: `${projectFrameStyle.height}px`,
                     }}
                 />
+            )}
+
+            {!isBusy && (
+                <button
+                    type="button"
+                    className={`editor-canvas-compare-button${isComparing ? " is-active" : ""}`}
+                    onPointerDown={canCompare ? startCompare : undefined}
+                    onPointerUp={endCompare}
+                    onKeyDown={canCompare ? handleCompareKeyDown : undefined}
+                    onKeyUp={endCompare}
+                    disabled={!canCompare}
+                    aria-pressed={isComparing}
+                    title={canCompare ? "Hold to compare before / after" : "Compare (no changes yet)"}
+                >
+                    <ArrowLeftRight className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>{isComparing ? "Before" : "Compare"}</span>
+                </button>
             )}
 
             <div

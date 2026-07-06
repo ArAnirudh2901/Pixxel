@@ -534,7 +534,7 @@ const ImageManager = ({ project, dominantColor }) => {
                                     />
                                 ) : (
                                     <span
-                                        className="text-[11px] font-medium flex-1 truncate"
+                                        className="text-[11px] font-medium flex-1 min-w-0 truncate"
                                         style={{ color: 'var(--text-primary)' }}
                                         onDoubleClick={(e) => { e.stopPropagation(); beginRename(img) }}
                                         title="Double-click to rename"

@@ -72,3 +72,10 @@ skills-lock.json
 *.flv
 *.wmv
 *.m4v
+
+# onnxruntime-web runtime files copied by scripts/setup-ort.mjs
+public/ort/
+
+# Python bytecode cache
+__pycache__/
+*.pyc

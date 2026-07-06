@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover - optional accel
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from PIL import Image, ImageDraw, ImageFilter, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFilter, ImageOps, UnidentifiedImageError
 from rembg import new_session, remove
 from starlette.concurrency import run_in_threadpool
 
@@ -210,6 +210,14 @@ ALLOWED_MODELS = {
     "u2net_cloth_seg",
     "silueta",
     "bria-rmbg",
+    # birefnet-* need rembg >= 2.0.57; birefnet-general is the quality pick
+    # for backlit/complex mattes (~930 MB first download).
+    "birefnet-general",
+    "birefnet-general-lite",
+    "birefnet-portrait",
+    "birefnet-dis",
+    "birefnet-hrsod",
+    "birefnet-massive",
 }
 
 if MODEL_NAME not in ALLOWED_MODELS:
@@ -220,9 +228,15 @@ if MODEL_NAME not in ALLOWED_MODELS:
 # ─── Execution-provider auto-detect (ONNX / rembg) ──────────────────────────
 
 def detect_providers() -> List[str]:
-    """Pick the best ONNX Runtime execution providers for this machine.
+    """Pick the ONNX Runtime execution providers for the rembg session.
 
-    Order of preference: CUDA (NVIDIA) > CoreML (Apple Silicon) > CPU.
+    Order of preference: CUDA (NVIDIA) > CPU. CoreML is deliberately NOT
+    preferred on Apple Silicon: this process also loads the torch/MPS models
+    (SAM 3, Depth Anything), and the rembg CoreML session intermittently
+    HARD-FAILS at inference under that Neural-Engine contention (ONNXRuntime
+    error -1, "Unable to compute the prediction"), which 500s /crop/auto. CoreML
+    is also ~6× slower than CPU for isnet-general-use here. Opt back in with
+    SEGMENT_PROVIDERS=CoreMLExecutionProvider,CPUExecutionProvider.
     """
     override = os.getenv("SEGMENT_PROVIDERS", "").strip()
     if override:
@@ -231,16 +245,30 @@ def detect_providers() -> List[str]:
     providers: List[str] = ["CPUExecutionProvider"]
     try:
         import onnxruntime as ort  # type: ignore
-        available = set(ort.get_available_providers())
-        if "CUDAExecutionProvider" in available:
+        if "CUDAExecutionProvider" in set(ort.get_available_providers()):
             providers.insert(0, "CUDAExecutionProvider")
             log.info("ONNX CUDA execution provider detected (NVIDIA GPU)")
-        elif "CoreMLExecutionProvider" in available:
-            providers.insert(0, "CoreMLExecutionProvider")
-            log.info("ONNX CoreML execution provider detected (Apple Silicon GPU)")
     except Exception as e:  # pragma: no cover - best effort
         log.debug("onnxruntime provider probe failed: %s", e)
     return providers
+
+
+def _rembg_matte(img: "Image.Image") -> "Image.Image":
+    """rembg saliency matte ('L'), self-healing to a CPU session on provider
+    failure (e.g. a CoreML session set via SEGMENT_PROVIDERS dying under MPS
+    contention). CPU is the default, so on a healthy box this is a passthrough."""
+    try:
+        return remove(img, session=app.state.session, only_mask=True)
+    except Exception as e:
+        if app.state.providers == ["CPUExecutionProvider"]:
+            raise
+        log.warning(
+            "rembg inference failed on %s (%s); rebuilding session on CPU",
+            app.state.providers, e,
+        )
+        app.state.session = new_session(app.state.model_name, providers=["CPUExecutionProvider"])
+        app.state.providers = ["CPUExecutionProvider"]
+        return remove(img, session=app.state.session, only_mask=True)
 
 
 # ─── Torch device ────────────────────────────────────────────────────────────
@@ -1094,7 +1122,15 @@ def _load_lama(app: FastAPI) -> bool:
         # Monkey-patch torch.jit.load to force map_location='cpu' so the
         # checkpoint is remapped transparently.
         _orig_jit_load = torch.jit.load
-        def _cpu_jit_load(f, _map_location=None, **kw):
+        def _cpu_jit_load(f, *args, **kw):
+            # Absorb ANY caller-supplied map_location — positional (args[0],
+            # swallowed by *args and not forwarded) or keyword (popped from kw)
+            # — then force "cpu". The previous signature only caught a
+            # positional value; simple-lama calls `torch.jit.load(path,
+            # map_location=device)` with the KEYWORD form, which slipped into
+            # **kw and collided with the hardcoded map_location="cpu"
+            # ("got multiple values for keyword argument 'map_location'").
+            kw.pop("map_location", None)
             return _orig_jit_load(f, map_location="cpu", **kw)
         torch.jit.load = _cpu_jit_load
         try:
@@ -1400,11 +1436,19 @@ async def inpaint(
 
     image_bytes = await _read_limited(image)
     mask_bytes = await _read_limited(mask)
-
-    def _run():
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if not image_bytes or not mask_bytes:
+        raise HTTPException(400, "empty upload")
+    # Decode defensively (same as /crop/auto) — garbage bytes must 400, not 500.
+    try:
+        # exif_transpose BEFORE convert: camera JPEGs store rotation in EXIF,
+        # and inpainting the raw pixels would return a result rotated relative
+        # to what the caller (and their mask) sees. No-op without EXIF.
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
         msk = Image.open(io.BytesIO(mask_bytes)).convert("L")
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as e:
+        raise HTTPException(400, f"could not decode image or mask: {e}")
 
+    def _run(img=img, msk=msk):
         # Resize mask to match image if needed
         if msk.size != img.size:
             msk = msk.resize(img.size, Image.NEAREST)
@@ -2041,9 +2085,16 @@ async def crop_auto(
     try:
         img = Image.open(io.BytesIO(contents))
         img.load()
+        # Camera JPEGs store rotation in EXIF; crop boxes are computed on raw
+        # pixels, so without this they come back rotated vs what the caller sees.
+        img = ImageOps.exif_transpose(img)
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as e:
         raise HTTPException(400, f"could not decode image: {e}")
 
+    if img.mode in ("I", "I;16", "I;16B", "I;16L", "I;16N"):
+        # 16/32-bit greyscale: convert("RGB") truncates instead of rescaling,
+        # blacking the frame out — rescale to 8-bit first.
+        img = Image.fromarray(np.clip(np.asarray(img, dtype=np.float32) / 257.0, 0, 255).astype(np.uint8), "L")
     if img.mode not in ("RGB", "RGBA", "L"):
         img = img.convert("RGB")
 
@@ -2105,9 +2156,7 @@ async def crop_auto(
                     union_mask = union
 
             if union_mask is None:
-                matte_img = await run_in_threadpool(
-                    remove, img, session=app.state.session, only_mask=True
-                )
+                matte_img = await run_in_threadpool(_rembg_matte, img)
                 raw_matte = np.asarray(matte_img.convert("L"), dtype=np.uint8)
                 matte = await run_in_threadpool(clean_matte, raw_matte, rgb)
                 union_mask = matte.copy()

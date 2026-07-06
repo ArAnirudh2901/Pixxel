@@ -40,15 +40,32 @@ export const TEXTURE_BACKED_KINDS = ['semantic', 'lasso', 'brush', 'smartBrush']
  * result written to alpha; opaque luma-styled canvases (lasso/semantic — the
  * shader samples R) get it written to RGB.
  *
- * @param {HTMLCanvasElement} canvas
+ * @param {HTMLCanvasElement|ImageData|CanvasImageSource} source
  * @param {number} px
  * @returns {HTMLCanvasElement} a NEW canvas (the input is untouched)
  */
-export const growMaskCanvas = (canvas, px) => {
-    const w = canvas.width
-    const h = canvas.height
-    const src = canvas.getContext('2d', { willReadFrequently: true })
-    const data = src.getImageData(0, 0, w, h)
+export const growMaskCanvas = (source, px) => {
+    // Accept every shape setMaskTexture stores: HTMLCanvasElement (brush /
+    // lasso rasters), ImageData (the AI Select Subject path stores the decoded
+    // matte's ImageData directly — calling getContext on it threw
+    // "canvas.getContext is not a function" and silently broke the Boundary
+    // slider for AI subject layers), or any drawable (ImageBitmap /
+    // HTMLImageElement from texture restore).
+    const w = source.width
+    const h = source.height
+    let data
+    if (typeof ImageData !== 'undefined' && source instanceof ImageData) {
+        data = source
+    } else if (typeof source.getContext === 'function') {
+        data = source.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h)
+    } else {
+        const tmp = document.createElement('canvas')
+        tmp.width = w
+        tmp.height = h
+        const tctx = tmp.getContext('2d', { willReadFrequently: true })
+        tctx.drawImage(source, 0, 0)
+        data = tctx.getImageData(0, 0, w, h)
+    }
     const pxs = data.data
 
     let alphaStyled = false
@@ -164,4 +181,146 @@ export const expandLayerBoundary = (image, layerId, px) => {
         })
     }
     return { id: layerId, growPx: dist }
+}
+
+/* ─── Brush-refine (ported from mask-studio) ────────────────────────────────
+ * Paint DIRECTLY on a texture-backed layer's mask to add or remove coverage,
+ * stroke by stroke — instead of committing new layers. `beginLayerRefine`
+ * normalises the layer's texture onto a paintable working canvas (preserving
+ * the kind's coverage channel: painted alpha for the plain brush, opaque
+ * red/luma for semantic & friends) and swaps it in under a NEW key (the
+ * pre-refine texture stays cached under the old key). `applyRefineStroke`
+ * composites a finished brush stroke into that canvas and re-renders through
+ * the same direct filter path the Boundary slider uses.
+ */
+
+// Draw any texture shape (canvas / ImageData / drawable) scaled into a ctx.
+const drawTextureInto = (ctx, tex, w, h) => {
+    if (typeof ImageData !== 'undefined' && tex instanceof ImageData) {
+        const tmp = document.createElement('canvas')
+        tmp.width = tex.width
+        tmp.height = tex.height
+        tmp.getContext('2d').putImageData(tex, 0, 0)
+        ctx.drawImage(tmp, 0, 0, w, h)
+        return
+    }
+    ctx.drawImage(tex, 0, 0, w, h)
+}
+
+/**
+ * Start a brush-refine session on a texture-backed layer.
+ *
+ * @param {object} image   Fabric image carrying the megashader filter
+ * @param {string} layerId
+ * @param {{width: number, height: number}} dims  working-canvas size (use the
+ *                                                brush canvas dims so strokes
+ *                                                composite 1:1)
+ * @returns {{layerId: string, key: string, keyField: string, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, channel: 'alpha' | 'red'}}
+ */
+export const beginLayerRefine = (image, layerId, dims) => {
+    const filter = getFilter(image)
+    const chain = filter?.stack?.chain
+    if (!Array.isArray(chain)) throw new Error('[mask-grow] no mask chain on this image')
+    const idx = chain.findIndex((e) => e?.layer?.id === layerId)
+    if (idx < 0) throw new Error(`[mask-grow] no layer ${layerId}`)
+    const entry = chain[idx]
+    const layer = entry.layer
+    const keyField = layer.maskTextureKey ? 'maskTextureKey' : layer.brushTextureKey ? 'brushTextureKey' : null
+    if (!TEXTURE_BACKED_KINDS.includes(layer.kind) || !keyField) {
+        throw new Error(`[mask-grow] layer ${layerId} (${layer.kind}) has no paintable mask texture`)
+    }
+    const tex = getMaskTexture(layer[keyField])
+    if (!tex) throw new Error('[mask-grow] mask texture is gone (reselect the subject)')
+
+    const w = Math.max(1, Math.round(dims?.width || tex.width || 1))
+    const h = Math.max(1, Math.round(dims?.height || tex.height || 1))
+    const cv = document.createElement('canvas')
+    cv.width = w
+    cv.height = h
+    const cx = cv.getContext('2d', { willReadFrequently: true })
+    // Coverage channel per kind — same convention as growMaskCanvas: the
+    // plain brush samples painted alpha; every other kind samples R off an
+    // opaque canvas, so start from solid black.
+    const channel = layer.kind === 'brush' ? 'alpha' : 'red'
+    if (channel === 'red') {
+        cx.fillStyle = '#000'
+        cx.fillRect(0, 0, w, h)
+    }
+    if (tex.width) drawTextureInto(cx, tex, w, h)
+
+    const key = `refine-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    setMaskTexture(key, cv)
+    const nextChain = chain.slice()
+    nextChain[idx] = {
+        op: entry.op,
+        layer: sanitiseLayer({
+            ...layer,
+            [keyField]: key,
+            // The working canvas is also the boundary base, so grow/shrink
+            // always readjusts from the latest painted edge.
+            baseTextureKey: key,
+            growPx: 0,
+        }),
+    }
+    const stack = { chain: nextChain }
+    applyMegashaderFilter(image, stack, {
+        globalMaskAlpha: filter?.globalMaskAlpha ?? 1,
+        globalInvert: filter?.globalInvert ?? false,
+        maskOverlay: filter?.maskOverlay ?? false,
+    })
+    try { image.canvas?.requestRenderAll?.() } catch { /* headless */ }
+    try { window.dispatchEvent(new CustomEvent('phosmith:mask-chain-replaced', { detail: { stack } })) } catch { /* SSR */ }
+    return { layerId, key, keyField, canvas: cv, ctx: cx, channel }
+}
+
+/**
+ * Composite a finished brush stroke into a refine session's working canvas
+ * and re-render. Stroke canvas must match the session canvas dims (both come
+ * from the Mask tool's brush canvas). Studio semantics: add paints white,
+ * erase paints black (red channel) or punches alpha out (alpha channel).
+ *
+ * @param {object} image
+ * @param {ReturnType<typeof beginLayerRefine>} session
+ * @param {HTMLCanvasElement} strokeCanvas  painted alpha stencil
+ * @param {{erase?: boolean}} [opts]
+ */
+export const applyRefineStroke = (image, session, strokeCanvas, { erase = false } = {}) => {
+    const { ctx, canvas, channel } = session || {}
+    if (!ctx || !canvas || !strokeCanvas) return
+    // Re-tint the stencil (erase strokes preview red on the overlay) to the
+    // target coverage colour while keeping its soft alpha edge.
+    const tmp = document.createElement('canvas')
+    tmp.width = canvas.width
+    tmp.height = canvas.height
+    const tx = tmp.getContext('2d')
+    tx.drawImage(strokeCanvas, 0, 0, tmp.width, tmp.height)
+    tx.globalCompositeOperation = 'source-in'
+    tx.fillStyle = erase && channel === 'red' ? '#000' : '#fff'
+    tx.fillRect(0, 0, tmp.width, tmp.height)
+
+    if (channel === 'alpha') {
+        ctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over'
+        ctx.drawImage(tmp, 0, 0)
+        ctx.globalCompositeOperation = 'source-over'
+    } else {
+        ctx.drawImage(tmp, 0, 0)
+    }
+
+    // Chain fields are unchanged — re-applying the filter re-uploads the
+    // mutated working canvas (textures are re-read per application).
+    const filter = getFilter(image)
+    if (filter) {
+        applyMegashaderFilter(image, filter.stack, {
+            globalMaskAlpha: filter.globalMaskAlpha ?? 1,
+            globalInvert: filter.globalInvert ?? false,
+            maskOverlay: filter.maskOverlay ?? false,
+        })
+    }
+    try { image.canvas?.requestRenderAll?.() } catch { /* headless */ }
+    if (!isAgentActing()) {
+        recordChange({
+            label: erase ? 'Mask: erase region' : 'Mask: add region',
+            domain: 'mask',
+        })
+    }
 }

@@ -325,7 +325,7 @@ const EraseControls = ({ project, dominantColor }) => {
                 )}
             </div>
 
-            {/* AI object eraser — SAM 2: click an object, the model segments
+            {/* AI object eraser — SAM 3: click an object, the model segments
                 the WHOLE object under the pointer and erases it. Click more
                 objects to erase each (multi-subject by accumulation). */}
             <div className="space-y-2" style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
@@ -399,8 +399,8 @@ const EraseControls = ({ project, dominantColor }) => {
                             {tool.isObjectRunning
                                 ? (tool.objectPhase === 'filling'
                                     ? 'AI is generating the background texture'
-                                    : 'SAM 2 is segmenting the object you clicked')
-                                : 'SAM 2 detects the object, AI fills the background — click each subject to remove'}
+                                    : 'SAM 3 is segmenting the object you clicked')
+                                : 'SAM 3 detects the object, AI fills the background — click each subject to remove'}
                         </div>
                     </div>
                 </motion.button>

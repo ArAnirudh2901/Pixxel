@@ -125,10 +125,12 @@ export const analyzeRange = (map) => {
  * @param {{ width:number, height:number, coverage:number, bbox:number[]|null }|null} [results.segment]
  *        Background-removal matte stats. OPTIONAL: omit the key entirely to
  *        skip the segmentation checks; null means it ran and failed.
+ * @param {{ width:number, height:number, coverage:number, bbox:number[]|null }|null} [results.sam]
+ *        Click-select mask stats (same optional/null contract as segment).
  * @param {{ cx:number, cy:number, w:number, h:number }} disc  expected target
  * @returns {{ ok:boolean, checks:Array<{label:string, ok:boolean, detail:string}> }}
  */
-export const evaluateSelfTest = ({ ground, depth, segment }, disc) => {
+export const evaluateSelfTest = ({ ground, depth, segment, sam }, disc) => {
     const checks = []
 
     const gFound = Boolean(ground?.found)
@@ -180,6 +182,27 @@ export const evaluateSelfTest = ({ ground, depth, segment }, disc) => {
             label: 'Subject matte covers the disc center',
             ok: segCentered,
             detail: segment?.bbox ? `bbox ${segment.bbox.join(',')}` : 'no bbox',
+        })
+    }
+
+    if (sam !== undefined) {
+        // A click on the disc center must select a real partial region…
+        const coverageOk = Boolean(sam) && sam.coverage > 0.01 && sam.coverage < 0.9
+        checks.push({
+            label: 'Click-select isolates a region',
+            ok: coverageOk,
+            detail: sam ? `coverage ${sam.coverage.toFixed(3)}` : 'no output',
+        })
+        // …whose bbox contains the clicked point.
+        let samCentered = false
+        if (sam && Array.isArray(sam.bbox)) {
+            const [x, y, w, h] = sam.bbox
+            samCentered = disc.cx >= x && disc.cx <= x + w && disc.cy >= y && disc.cy <= y + h
+        }
+        checks.push({
+            label: 'Click-select mask covers the click point',
+            ok: samCentered,
+            detail: sam?.bbox ? `bbox ${sam.bbox.join(',')}` : 'no bbox',
         })
     }
 
