@@ -63,7 +63,8 @@ import { registerExtendHost } from "../../../../../lib/extend-poller"
 import { isAgentActing, recordChange, setJournalProject } from "../../../../../lib/change-journal"
 import { describeCanvasChange } from "../../../../../lib/canvas-change-describe"
 import { isExpansionFrameLike, removeExpansionFramesFromCanvas } from "../../../../../lib/expansion-pipeline"
-import { addImageFilesToCanvas } from "../../../../../lib/canvas-images"
+import { addImageFilesToCanvas, fabricImageFromUrl } from "../../../../../lib/canvas-images"
+import { isRawFile } from "../../../../../lib/raw-preview"
 import {
     fetchCachedSnapshot,
     flushToNeon,
@@ -918,7 +919,7 @@ const CanvasEditor = ({ project }) => {
             if (!canvasState && (effectiveCurrentImageUrl || proj.originalImageUrl)) {
                 try {
                     const imageUrl = effectiveCurrentImageUrl || proj.originalImageUrl
-                    const fabricImage = await FabricImage.fromURL(imageUrl, { crossOrigin: "anonymous" })
+                    const fabricImage = await fabricImageFromUrl(imageUrl)
                     fitImageInsideProject(fabricImage, proj)
                     canvas.add(fabricImage)
                 } catch (error) { console.error("Error loading project image:", error) }
@@ -960,7 +961,7 @@ const CanvasEditor = ({ project }) => {
                     const imageUrl = effectiveCurrentImageUrl || proj.originalImageUrl
                     if (imageUrl && canvas.getObjects().length === 0) {
                         try {
-                            const fallbackImage = await FabricImage.fromURL(imageUrl, { crossOrigin: "anonymous" })
+                            const fallbackImage = await fabricImageFromUrl(imageUrl)
                             fitImageInsideProject(fallbackImage, proj)
                             canvas.add(fallbackImage)
                             canvas.requestRenderAll()
@@ -1815,7 +1816,7 @@ const CanvasEditor = ({ project }) => {
             const canvas = canvasInstanceRef.current
             if (!canvas) return
 
-            const files = Array.from(e.dataTransfer?.files || []).filter(f => f.type.startsWith('image/'))
+            const files = Array.from(e.dataTransfer?.files || []).filter(f => f.type.startsWith('image/') || isRawFile(f))
             if (files.length === 0) return
 
             // Use a ref so this handler always sees the latest project, even if the

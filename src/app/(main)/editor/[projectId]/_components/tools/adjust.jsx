@@ -20,6 +20,10 @@ const TEMP_COOL = "#72b7ff"
 const VIGNETTE_LAYER_NAME = "phosmith-vignette-overlay"
 const HISTOGRAM_BUCKETS = 256
 const HISTOGRAM_SAMPLE_SIZE = 260
+// During a slider/curve drag we filter a downscaled proxy of the source (this
+// long-edge cap) instead of the full-res image, so each RAF-gated applyFilters()
+// touches ~1 MP instead of 50 MP. Full-res is restored + refiltered on commit.
+const PROXY_MAX_PX = 1000
 const CURVE_GRAPH = {
     left: 8,
     top: 8,
@@ -273,6 +277,40 @@ const getHistogramSourceElement = (image) =>
     image?._filteredEl ||
     image?._cacheCanvas ||
     null
+
+// Downscale a source element (img/canvas) to a proxy canvas whose long edge is
+// PROXY_MAX_PX, using pure browser APIs (createImageBitmap's off-thread resize,
+// falling back to a canvas draw). Returns null when the source is already small
+// enough (no proxy needed) — enterPreviewMode treats null as "don't swap", so
+// tiny images keep filtering full-res.
+const buildProxyCanvas = async (sourceEl) => {
+    if (!sourceEl || typeof document === "undefined") return null
+    const W = sourceEl.naturalWidth || sourceEl.width || 0
+    const H = sourceEl.naturalHeight || sourceEl.height || 0
+    if (!W || !H || Math.max(W, H) <= PROXY_MAX_PX) return null
+    const scale = PROXY_MAX_PX / Math.max(W, H)
+    const pw = Math.max(1, Math.round(W * scale))
+    const ph = Math.max(1, Math.round(H * scale))
+    const out = document.createElement("canvas")
+    out.width = pw
+    out.height = ph
+    const ctx = out.getContext("2d")
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = "high"
+    try {
+        // Prefer the browser's own high-quality resize (runs off the main thread
+        // where supported). Explicit dest dims keep it correct even on engines
+        // that ignore resizeWidth (older Safari) — there the canvas smoothing
+        // does the downscale.
+        const bmp = await createImageBitmap(sourceEl, { resizeWidth: pw, resizeHeight: ph, resizeQuality: "high" })
+        ctx.drawImage(bmp, 0, 0, pw, ph)
+        bmp.close?.()
+    } catch {
+        // Fallback: direct canvas downscale (e.g. createImageBitmap unavailable).
+        ctx.drawImage(sourceEl, 0, 0, pw, ph)
+    }
+    return out
+}
 
 const emptyHistogram = () => ({
     red: Array(HISTOGRAM_BUCKETS).fill(0),
@@ -1207,6 +1245,92 @@ const AdjustControls = () => {
     const histogramFrameRef = useRef(null)
     const pendingPreviewRef = useRef(null)
     const isInteractingRef = useRef(false)
+    // Preview-proxy state. proxyCacheRef: adjustmentId -> { canvas|null, srcW, srcH }
+    // (canvas === null means the image is already ≤ PROXY_MAX_PX, so no proxy is
+    // needed). previewSwapRef holds the images whose _originalElement is currently
+    // pointed at their proxy so the drag can be restored to full-res on commit.
+    const proxyCacheRef = useRef(new Map())
+    const previewSwapRef = useRef([])
+    const previewActiveRef = useRef(false)
+
+    // Kick off (async) a downscaled proxy for `img`, cached by its adjustment
+    // id. No-op if a proxy for the same source dims already exists or is in
+    // flight. Never throws into the caller.
+    const ensureProxyFor = (img) => {
+        if (!img?._originalElement) return
+        // A cropped image (cropX/cropY in full-res px) would misalign against a
+        // downscaled source, so skip the proxy for those — they stay full-res.
+        if (img.cropX || img.cropY) return
+        const id = ensureAdjustmentObjectId(img)
+        const src = img._originalElement
+        const W = src.naturalWidth || src.width || 0
+        const H = src.naturalHeight || src.height || 0
+        if (!W || !H) return
+        const cached = proxyCacheRef.current.get(id)
+        if (cached && cached.srcW === W && cached.srcH === H) return // ready or in flight
+        proxyCacheRef.current.set(id, { canvas: null, srcW: W, srcH: H }) // reserve
+        buildProxyCanvas(src)
+            .then((canvas) => {
+                const entry = proxyCacheRef.current.get(id)
+                if (entry && entry.srcW === W && entry.srcH === H) {
+                    proxyCacheRef.current.set(id, { canvas, srcW: W, srcH: H })
+                }
+            })
+            .catch(() => {
+                const entry = proxyCacheRef.current.get(id)
+                if (entry && entry.srcW === W && entry.srcH === H) proxyCacheRef.current.delete(id)
+            })
+    }
+
+    // Point each drag target's _originalElement at its ready proxy so preview
+    // applyFilters() runs on ~1 MP. Idempotent; targets without a ready proxy
+    // stay full-res (still RAF-gated).
+    const enterPreviewMode = () => {
+        if (previewActiveRef.current) return
+        previewActiveRef.current = true
+        const swapped = []
+        for (const img of getAdjustmentTargets(canvasEditor)) {
+            if (img?.cropX || img?.cropY) continue // cropped images stay full-res (see ensureProxyFor)
+            const id = img?.phosmithAdjustmentId || img?._phosmithAdjustmentId
+            const entry = id ? proxyCacheRef.current.get(id) : null
+            if (entry?.canvas && img._originalElement && img._originalElement !== entry.canvas) {
+                swapped.push({ img, fullEl: img._originalElement })
+                img._originalElement = entry.canvas
+                // Point _element at the proxy too so applyFilters() allocates a
+                // FRESH proxy-sized canvas. If _element still referenced the
+                // full-res source (a freshly loaded image with no filters yet),
+                // Fabric would write the filtered pixels straight into the
+                // original source canvas and corrupt it.
+                img._element = entry.canvas
+                img._filteredEl = undefined
+                // WebGL caches the SOURCE texture by cacheKey and applyFilters()
+                // only evicts the _filtered texture — evict the source ourselves
+                // on every _originalElement change or the proxy/full-res textures
+                // cross. No-op on Canvas2D.
+                img.removeTexture?.(img.cacheKey)
+            }
+        }
+        previewSwapRef.current = swapped
+    }
+
+    // Restore full-res source elements. Called before every commit (so the
+    // committed apply + histogram read the full-res source) and defensively on
+    // selection change / unmount.
+    const exitPreviewMode = () => {
+        if (!previewActiveRef.current) return
+        previewActiveRef.current = false
+        for (const { img, fullEl } of previewSwapRef.current) {
+            img._originalElement = fullEl
+            // Fabric reuses a stale _filteredEl (still at proxy size) and only
+            // clears it, never resizes it — so a full-res commit would render
+            // into the 1000px canvas. Point _element back at the original and
+            // drop _filteredEl so applyFilters() rebuilds a full-res canvas.
+            img._element = fullEl
+            img._filteredEl = undefined
+            img.removeTexture?.(img.cacheKey) // evict the proxy SOURCE texture too
+        }
+        previewSwapRef.current = []
+    }
 
     const queueCurveHistogramRefresh = useCallback((image) => {
         if (histogramFrameRef.current) {
@@ -1228,6 +1352,15 @@ const AdjustControls = () => {
             const img = getAdjustmentSourceImage(canvasEditor)
             const next = img ? getValuesFromImageFilters(img) : { ...DEFAULT_VALUES }
             queueCurveHistogramRefresh(img)
+            // Eagerly build proxies for the current drag targets so they're ready
+            // before the next gesture; prune cache entries for images no longer present.
+            const targets = getAdjustmentTargets(canvasEditor)
+            targets.forEach(ensureProxyFor)
+            const liveIds = new Set(getVisibleImages(canvasEditor)
+                .map((im) => im.phosmithAdjustmentId || im._phosmithAdjustmentId).filter(Boolean))
+            for (const key of proxyCacheRef.current.keys()) {
+                if (!liveIds.has(key)) proxyCacheRef.current.delete(key)
+            }
             pendingPreviewRef.current = null
             if (previewFrame.current) {
                 cancelAnimationFrame(previewFrame.current)
@@ -1244,6 +1377,8 @@ const AdjustControls = () => {
         canvasEditor.on("selection:cleared", sync)
         canvasEditor.on("object:added", sync)
         return () => {
+            exitPreviewMode() // restore any swapped source before teardown
+            proxyCacheRef.current.clear()
             pendingPreviewRef.current = null
             if (previewFrame.current) cancelAnimationFrame(previewFrame.current)
             if (histogramFrameRef.current) {
@@ -1259,12 +1394,16 @@ const AdjustControls = () => {
 
     const handleBeginChange = () => {
         isInteractingRef.current = true
+        enterPreviewMode() // swap targets to their downscaled proxy for the drag
     }
 
     const applyNextValues = (next, { commit = false, updateState = false } = {}) => {
         latestRef.current = next
         if (updateState) setValues(next)
         const nextSig = getValuesSignature(next)
+        // Restore full-res source BEFORE the committed apply so it's lossless and
+        // the source histogram reads full-res.
+        if (commit) exitPreviewMode()
         applyAdjustmentFilters(canvasEditor, next, sigRef, { commit: commit && nextSig !== committedSigRef.current })
         // Histogram is computed from the source image (see getHistogramSourceElement)
         // so it doesn't change during a drag — no refresh needed on every preview frame.
@@ -1272,6 +1411,25 @@ const AdjustControls = () => {
             committedSigRef.current = nextSig
             isInteractingRef.current = false
         }
+    }
+
+    // RAF-gated preview: pointermove fires at 60-240Hz, but full-res
+    // img.applyFilters() only needs to run once per frame with the newest
+    // value. Without this, every move ran applyFilters synchronously and
+    // froze the slider handle on large images. State (latestRef / curve SVG)
+    // still updates synchronously so the UI tracks the drag in real time;
+    // only the expensive filter apply is coalesced to one call per frame.
+    const schedulePreview = (next, { updateState = false } = {}) => {
+        latestRef.current = next
+        if (updateState) setValues(next)
+        pendingPreviewRef.current = next
+        if (previewFrame.current) return
+        previewFrame.current = requestAnimationFrame(() => {
+            previewFrame.current = null
+            const v = pendingPreviewRef.current
+            pendingPreviewRef.current = null
+            if (v) applyAdjustmentFilters(canvasEditor, v, sigRef, { commit: false })
+        })
     }
 
     const handlePreviewChange = (key, v) => {
@@ -1282,7 +1440,7 @@ const AdjustControls = () => {
         const next = { ...prev, [key]: val }
         // For curve points, update React state immediately so the SVG path
         // re-renders in real-time while dragging (not just on mouse-up).
-        applyNextValues(next, { updateState: isPointsKey })
+        schedulePreview(next, { updateState: isPointsKey })
     }
 
     const handleCommitChange = (key, v) => {
@@ -1304,7 +1462,22 @@ const AdjustControls = () => {
     const handleWheelAmount = (key, v, commit) => {
         const val = Array.isArray(v) ? v[0] : v
         const next = { ...latestRef.current, [key]: val }
-        applyNextValues(next, { commit, updateState: commit })
+        if (commit) {
+            // Drop any pending preview frame so it can't overwrite the
+            // committed full-res result after mouse-up.
+            if (previewFrame.current) {
+                cancelAnimationFrame(previewFrame.current)
+                previewFrame.current = null
+            }
+            pendingPreviewRef.current = null
+            applyNextValues(next, { commit: true, updateState: true })
+        } else {
+            // Color wheels have no onBegin hook — enter preview mode on the first
+            // drag frame (idempotent). Committed on release via the branch above.
+            isInteractingRef.current = true
+            enterPreviewMode()
+            schedulePreview(next)
+        }
     }
 
     const resolveImageKitUrl = async (url, { source, tokens }) => {
@@ -1366,6 +1539,7 @@ const AdjustControls = () => {
             previewFrame.current = null
         }
         setValues(next)
+        exitPreviewMode() // restore full-res before applying the reset
         const nextSig = getValuesSignature(next)
         applyAdjustmentFilters(canvasEditor, next, sigRef, { commit: nextSig !== committedSigRef.current })
         queueCurveHistogramRefresh()

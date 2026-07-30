@@ -9,6 +9,7 @@ import { useCanvas, useDynamicAccent } from '../../../../../../context/context'
 import usePlanAccess from '../../../../../../hooks/usePlanAccess'
 import UpgradeModel from '@/components/upgradeModel'
 import { addImageFilesToCanvas } from '@/lib/canvas-images'
+import { IMAGE_UPLOAD_ACCEPT } from '@/lib/raw-preview'
 import ProBadge from '@/components/pro-badge'
 import PhosmithWordmark from '@/components/phosmith-wordmark'
 import ShortcutsGuide from '@/components/neo/ShortcutsGuide'
@@ -498,7 +499,7 @@ const EditorTopbar = ({ project, onToggleSidebar, isSidebarOpen = false, isNarro
                     <input
                         ref={addImageInputRef}
                         type="file"
-                        accept="image/*"
+                        accept={IMAGE_UPLOAD_ACCEPT}
                         multiple
                         className="hidden"
                         onChange={async (e) => {

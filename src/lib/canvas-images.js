@@ -1,6 +1,7 @@
 import { FabricImage } from 'fabric'
 import { toast } from 'sonner'
 import { stripImageMetadata } from '@/lib/strip-metadata'
+import { isRawFile, extractRawPreview, readImageMeta } from '@/lib/raw-preview'
 
 const CASCADE_OFFSET = 32
 
@@ -22,52 +23,68 @@ const readFileAsDataURL = (file) =>
 const IMAGEKIT_MAX_MP = 24_000_000
 const MAX_EDGE = 8192
 
-const downscaleIfNeeded = (file) =>
-  new Promise((resolve) => {
-    // Only standard rasters need the check — blobs from canvas are already sized
-    if (!file?.type?.startsWith('image/')) return resolve(file)
+// Encode a resized bitmap to a Blob (OffscreenCanvas off the main thread where
+// available, else a DOM canvas). Returns null on failure.
+const encodeResized = async (bitmap, nw, nh, type) => {
+  const canvas = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(nw, nh)
+    : Object.assign(document.createElement('canvas'), { width: nw, height: nh })
+  const ctx = canvas.getContext('2d')
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(bitmap, 0, 0, nw, nh)
+  if (canvas.convertToBlob) return canvas.convertToBlob({ type, quality: 0.92 })
+  return new Promise((res) => canvas.toBlob(res, type, 0.92))
+}
 
-    const url = URL.createObjectURL(file)
-    const img = new Image()
-    img.onload = () => {
-      const w = img.naturalWidth || img.width || 0
-      const h = img.naturalHeight || img.height || 0
-      URL.revokeObjectURL(url)
+// Downscale anything above ImageKit's serving limits. Reads dimensions from the
+// header (512 KB) and resizes via createImageBitmap — a hardware-decoded,
+// off-main-thread path — so a 50 MP DSLR frame never freezes the tab the way a
+// synchronous <img> decode + canvas draw did.
+const downscaleIfNeeded = async (file) => {
+  if (!file?.type?.startsWith('image/')) return file // canvas blobs are pre-sized
 
-      if (w * h <= IMAGEKIT_MAX_MP && w <= MAX_EDGE && h <= MAX_EDGE) {
-        return resolve(file)            // within limits — use original
-      }
+  const meta = await readImageMeta(file)
+  let w = meta?.w || 0
+  let h = meta?.h || 0
+  let probe = null
+  if (!w || !h) {
+    // Unknown header — decode once off-thread to learn the size.
+    probe = await createImageBitmap(file).catch(() => null)
+    if (!probe) return file
+    w = probe.width
+    h = probe.height
+  }
 
-      // Downscale proportionally
-      let nw = w, nh = h
-      if (nw > MAX_EDGE || nh > MAX_EDGE) {
-        const s = MAX_EDGE / Math.max(nw, nh)
-        nw = Math.round(nw * s)
-        nh = Math.round(nh * s)
-      }
-      if (nw * nh > IMAGEKIT_MAX_MP) {
-        const s = Math.sqrt(IMAGEKIT_MAX_MP / (nw * nh))
-        nw = Math.round(nw * s)
-        nh = Math.round(nh * s)
-      }
+  if (w * h <= IMAGEKIT_MAX_MP && w <= MAX_EDGE && h <= MAX_EDGE) {
+    probe?.close?.()
+    return file // within limits — use original
+  }
 
-      const canvas = document.createElement('canvas')
-      canvas.width = nw
-      canvas.height = nh
-      const ctx = canvas.getContext('2d')
-      ctx.drawImage(img, 0, 0, nw, nh)
-      canvas.toBlob(
-        (blob) => {
-          if (!blob) return resolve(file)  // fallback to original
-          resolve(new File([blob], file.name, { type: blob.type, lastModified: Date.now() }))
-        },
-        'image/jpeg',
-        0.92,
-      )
-    }
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(file) }
-    img.src = url
-  })
+  // Target dims (proportional)
+  let nw = w, nh = h
+  if (nw > MAX_EDGE || nh > MAX_EDGE) {
+    const s = MAX_EDGE / Math.max(nw, nh)
+    nw = Math.round(nw * s); nh = Math.round(nh * s)
+  }
+  if (nw * nh > IMAGEKIT_MAX_MP) {
+    const s = Math.sqrt(IMAGEKIT_MAX_MP / (nw * nh))
+    nw = Math.round(nw * s); nh = Math.round(nh * s)
+  }
+
+  try {
+    // Explicit dest dims keep it correct where resizeWidth is ignored (older Safari).
+    const bitmap = probe || await createImageBitmap(file, { resizeWidth: nw, resizeHeight: nh, resizeQuality: 'high' })
+    const type = file.type === 'image/png' ? 'image/png' : 'image/jpeg'
+    const blob = await encodeResized(bitmap, nw, nh, type)
+    bitmap.close?.()
+    if (!blob) return file
+    return new File([blob], file.name, { type: blob.type, lastModified: Date.now() })
+  } catch {
+    probe?.close?.()
+    return file // fall back to original — ImageKit may reject, but no freeze
+  }
+}
 
 // Uploads to our /api/imagekit/upload endpoint (auth-gated) and returns the CDN URL.
 // This is the path that keeps saved canvas state small enough for Neon's per-doc
@@ -111,21 +128,93 @@ export const uploadImageBlobToImageKit = async (blob, fileName = 'image.png') =>
   return data.url
 }
 
+// Builds a Fabric image from a URL with an OFF-MAIN-THREAD decode. Fabric's own
+// loadImage only waits on img.onload, so the JPEG decode lands on first draw and
+// freezes the UI for a 12-50 MP DSLR. HTMLImageElement.decode() runs the decode
+// on a background thread; awaiting it means the bitmap is ready before render.
+// We keep el.src = url (not createImageBitmap) so getSrc() persists the URL —
+// undo/redo and reload recreate the image from serialized src.
+export const fabricImageFromUrl = async (url) => {
+  try {
+    const el = new Image()
+    el.crossOrigin = 'anonymous'
+    el.decoding = 'async'
+    el.src = url
+    await el.decode()
+    return new FabricImage(el)
+  } catch {
+    // decode() can reject (some data: URLs / CORS / older engines) — fall back
+    // to Fabric's own loader, which is functionally identical, just main-thread.
+    return FabricImage.fromURL(url, { crossOrigin: 'anonymous' })
+  }
+}
+
 export const loadFabricImageFromFile = async (file, { silent = false } = {}) =>
   loadFabricImage(file, { silent })
 
+// Bake an EXIF orientation into pixels. A RAW's rotation lives in the container
+// (IFD0), NOT in the extracted preview's own EXIF, and we strip metadata before
+// upload — so a portrait shot would arrive sideways unless we rotate it here.
+const bakeOrientation = async (blob, orientation) => {
+  if (!orientation || orientation === 1) return blob
+  const bmp = await createImageBitmap(blob).catch(() => null)
+  if (!bmp) return blob
+  const w = bmp.width, h = bmp.height
+  const swap = orientation >= 5 && orientation <= 8
+  const cw = swap ? h : w
+  const ch = swap ? w : h
+  const canvas = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(cw, ch)
+    : Object.assign(document.createElement('canvas'), { width: cw, height: ch })
+  canvas.width = cw; canvas.height = ch
+  const ctx = canvas.getContext('2d')
+  // Canonical EXIF-orientation canvas transforms (w/h are pre-rotation dims).
+  switch (orientation) {
+    case 2: ctx.transform(-1, 0, 0, 1, w, 0); break   // flip horizontal
+    case 3: ctx.transform(-1, 0, 0, -1, w, h); break  // rotate 180
+    case 4: ctx.transform(1, 0, 0, -1, 0, h); break   // flip vertical
+    case 5: ctx.transform(0, 1, 1, 0, 0, 0); break    // transpose
+    case 6: ctx.transform(0, 1, -1, 0, h, 0); break   // rotate 90 CW
+    case 7: ctx.transform(0, -1, -1, 0, h, w); break  // transverse
+    case 8: ctx.transform(0, -1, 1, 0, 0, w); break   // rotate 90 CCW
+    default: break
+  }
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(bmp, 0, 0)
+  bmp.close?.()
+  const out = canvas.convertToBlob
+    ? await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.95 })
+    : await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.95))
+  return out || blob
+}
+
+// Camera RAW is a container: lift out its full-res embedded JPEG preview (the
+// camera's own render) and edit THAT — a normal image/jpeg the rest of the
+// pipeline uploads, grades, serializes and restores like any photo. Throws
+// RAW_NO_PREVIEW when the container has no usable preview.
+const resolveSourceFile = async (file) => {
+  if (!isRawFile(file)) return file
+  const preview = await extractRawPreview(file).catch(() => null)
+  if (!preview?.blob) throw new Error('RAW_NO_PREVIEW')
+  const upright = await bakeOrientation(preview.blob, preview.orientation).catch(() => preview.blob)
+  const base = (file.name || 'photo').replace(/\.[^.]+$/, '')
+  return new File([upright], `${base}.jpg`, { type: 'image/jpeg', lastModified: Date.now() })
+}
+
 const loadFabricImage = async (file, { silent }) => {
+  const sourceFile = await resolveSourceFile(file)
   // Try ImageKit first — small URL, persistent, CDN-served.
   try {
-    const url = await uploadFileToImageKit(file)
-    return await FabricImage.fromURL(url, { crossOrigin: 'anonymous' })
+    const url = await uploadFileToImageKit(sourceFile)
+    return await fabricImageFromUrl(url)
   } catch (uploadError) {
     console.warn('[canvas-images] ImageKit upload failed, falling back to data URL:', uploadError)
     if (!silent) {
       toast.warning('Upload service unavailable — image saved locally; refresh may not restore it.')
     }
-    const dataUrl = await readFileAsDataURL(file)
-    return await FabricImage.fromURL(dataUrl, { crossOrigin: 'anonymous' })
+    const dataUrl = await readFileAsDataURL(sourceFile)
+    return await fabricImageFromUrl(dataUrl)
   }
 }
 
@@ -166,12 +255,20 @@ export const fitNewImageToProject = (fabricImage, projectSize, options = {}) => 
 export async function addImageFileToCanvas(canvasEditor, file, project, options = {}) {
   if (!canvasEditor || !file) return false
 
-  if (!file.type.startsWith('image/')) {
+  const raw = isRawFile(file)
+  if (!file.type.startsWith('image/') && !raw) {
     toast.error('Only image files are supported')
     return false
   }
-  if (file.size > 25 * 1024 * 1024) {
+  // A RAW container is large (20–60 MB), but only its small embedded preview is
+  // ever read/uploaded — so the 25 MB cap applies to standard images only. Guard
+  // RAW with a generous ceiling against pathological files.
+  if (!raw && file.size > 25 * 1024 * 1024) {
     toast.error('Image must be under 25 MB')
+    return false
+  }
+  if (raw && file.size > 200 * 1024 * 1024) {
+    toast.error('RAW file is too large')
     return false
   }
 
@@ -192,8 +289,11 @@ export async function addImageFileToCanvas(canvasEditor, file, project, options 
     }
     return img
   } catch (err) {
-    if (toastId) toast.error('Failed to load image', { id: toastId })
-    else toast.error('Failed to load image')
+    const msg = err?.message === 'RAW_NO_PREVIEW'
+      ? 'This RAW has no embedded preview to import'
+      : 'Failed to load image'
+    if (toastId) toast.error(msg, { id: toastId })
+    else toast.error(msg)
     console.error('[canvas-images] Load error:', err)
     return false
   }

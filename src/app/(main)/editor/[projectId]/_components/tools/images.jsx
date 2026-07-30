@@ -28,6 +28,7 @@ import {
 import { FabricImage } from 'fabric'
 import { ProRulerSlider } from '@/components/editor/ProRulerSlider'
 import { addImageFileToCanvas, loadFabricImageFromFile } from '@/lib/canvas-images'
+import { IMAGE_UPLOAD_ACCEPT } from '@/lib/raw-preview'
 import { toast } from 'sonner'
 import { motion, AnimatePresence } from 'framer-motion'
 
@@ -700,7 +701,7 @@ const ImageManager = ({ project, dominantColor }) => {
                     <input
                         ref={replaceInputRef}
                         type="file"
-                        accept="image/*"
+                        accept={IMAGE_UPLOAD_ACCEPT}
                         onChange={(e) => {
                             if (e.target.files?.[0]) replaceImage(e.target.files[0])
                             e.target.value = ''
