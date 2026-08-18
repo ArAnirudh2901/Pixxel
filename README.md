@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/WebGL2-GLSL%20ES%203.0-06B8D4?style=flat-square" alt="WebGL2" />
   <img src="https://img.shields.io/badge/Fabric.js-7-green?style=flat-square" alt="Fabric.js 7" />
   <img src="https://img.shields.io/badge/FastAPI-PyTorch-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
-  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License" />
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square" alt="AGPL-3.0 License" />
 </p>
 
 ---
@@ -572,6 +572,25 @@ Hugging Face Spaces provides a free 16 GB CPU container tier, which is comfortab
 - [Prisma Documentation](https://www.prisma.io/docs) — Database ORM
 - [Clerk Documentation](https://clerk.com/docs) — Authentication
 - [ImageKit Documentation](https://docs.imagekit.io/) — Image CDN and AI transforms
+
+---
+
+## 📄 License
+
+**GNU AGPL v3 or later** — see [LICENSE](LICENSE). Copyright © 2026 Anirudh
+Aravalli.
+
+Phosmith is also a build input to
+[Mask Studio](https://github.com/ArAnirudh2901/Image-Masking-test), which bundles
+`src/lib/megashader/` and the editor mask UI into its output. Mask Studio is
+AGPL-3.0 for its own reason (a YOLOE-derived detector), and this license is what
+lets the two combine.
+
+**If you deploy this.** AGPL §13 means anyone who uses a hosted Phosmith over a
+network must be offered the source of the version they are using. A "Source"
+link in the app shell pointing at this repo — or at your fork, if you modified
+it — is the usual way to satisfy that. The Vercel instructions above do not add
+one for you.
 
 ---
 
